@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fintrack_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fintrack
+      POSTGRES_PASSWORD: test@123
+      POSTGRES_DB: fintrack_db
+    ports:
+      # Só na interface local — não expõe o Postgres para a rede.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fintrack -d fintrack_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: fintrack_redis
+    restart: unless-stopped
+    environment:
+      # Senha de dev por padrão; sobrescreva com REDIS_PASSWORD no .env (o mesmo valor que a API usa).
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-fintrack_redis_dev}
+    command: >-
+      sh -c 'exec redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+      --requirepass "$$REDIS_PASSWORD"'
+    ports:
+      # Só na interface local — não expõe o Redis para a rede.
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: fintrack_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Dentro do container "localhost" é o próprio container: aponta para o serviço postgres.
+      # Sobrescreve o DATABASE_URL do .env (que usa localhost), pois a URL tem precedência sobre DB_HOST.
+      DATABASE_URL: postgresql://fintrack:test%40123@postgres:5432/fintrack_db
+      DB_HOST: postgres
+      REDIS_HOST: redis
+    ports:
+      - "3001:3001"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: npm run start:dev
+    profiles:
+      - full
+
+volumes:
+  postgres_data:
+  redis_data:

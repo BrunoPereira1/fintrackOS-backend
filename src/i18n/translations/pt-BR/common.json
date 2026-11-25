@@ -1,0 +1,15 @@
+{
+  "errors": {
+    "unauthorized": "Não autorizado",
+    "forbidden": "Acesso negado",
+    "notFound": "Recurso não encontrado",
+    "internalError": "Erro interno do servidor",
+    "planRequired": "Este recurso requer o plano {plan}",
+    "documentUnavailable": "Este documento não pode ser utilizado"
+  },
+  "success": {
+    "created": "Criado com sucesso",
+    "updated": "Atualizado com sucesso",
+    "deleted": "Removido com sucesso"
+  }
+}
