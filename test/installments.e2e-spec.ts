@@ -12,7 +12,7 @@ import { CardInvoicesService } from '../src/cards/card-invoices.service';
 import { CardBrand, CreditCard } from '../src/cards/entities/credit-card.entity';
 import { TransactionsModule } from '../src/transactions/transactions.module';
 import { TransactionsService } from '../src/transactions/transactions.service';
-import { TransactionType } from '../src/transactions/entities/transaction.entity';
+import { Transaction, TransactionType } from '../src/transactions/entities/transaction.entity';
 import { InstallmentsModule } from '../src/installments/installments.module';
 import { InstallmentsService } from '../src/installments/installments.service';
 import { Installment, InstallmentStatus } from '../src/installments/entities/installment.entity';
@@ -328,12 +328,15 @@ describe('Parcelas: status derivado, listagem e PATCH (e2e, banco real)', () => 
     const zeroUser = await newUser();
     try {
       const card = await newCard(zeroUser);
-      // R$ 0,01 em 2x → 0,00 (17/04) + 0,01 (17/05); antes, 100 em 17/04 sem pagamento
+      // Legado anterior ao D29: R$ 0,01 em 2x → 0,00 (17/04) + 0,01 (17/05); antes, 100 em
+      // 17/04 sem pagamento. Hoje a criação recusa (422), então grava R$ 0,02 em 2x e rebaixa
+      // no banco para o estado legado — que continua legível (business-rules §3)
+      let legacy: Transaction | undefined;
       for (const [total, count] of [
         [100, 1],
-        [0.01, 2],
+        [0.02, 2],
       ]) {
-        await transactions.create(zeroUser.id, Plan.PREMIUM, {
+        legacy = await transactions.create(zeroUser.id, Plan.PREMIUM, {
           description: 'Compra e2e',
           totalAmount: total,
           date: '2026-03-12',
@@ -342,6 +345,10 @@ describe('Parcelas: status derivado, listagem e PATCH (e2e, banco real)', () => 
           installmentsCount: count,
         });
       }
+      await db.getRepository(Transaction).update(legacy!.id, { totalAmount: 0.01 });
+      await db
+        .getRepository(Installment)
+        .update({ transactionId: legacy!.id, number: 1 }, { amount: 0 });
       const all = await installments.findAll(zeroUser.id, { page: 1, limit: 20 });
       const zero = all.data.find((d) => d.amount === 0)!;
       expect(zero.status).toBe('paid');

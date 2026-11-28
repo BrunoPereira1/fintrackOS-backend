@@ -10,7 +10,7 @@ import {
 import { ErrorMessages } from '../common/constants/error-messages';
 import { SplitsService } from './splits.service';
 import { CostSplit, SplitStatus } from './entities/cost-split.entity';
-import { TransactionsService } from '../transactions/transactions.service';
+import { RunLockedOptions, TransactionsService } from '../transactions/transactions.service';
 import { Transaction } from '../transactions/entities/transaction.entity';
 import { ContactsService } from '../contacts/contacts.service';
 import { Contact } from '../contacts/entities/contact.entity';
@@ -82,13 +82,28 @@ describe('SplitsService', () => {
       createQueryBuilder: jest.fn(() => qbMock),
     };
     // runLocked: executa o trabalho com a transação (posse via findOne) e um EntityManager
-    // cujo repositório de splits é o mesmo mock `repo`
+    // cujo repositório de splits é o mesmo mock `repo`. Como o real, troca o 404/403 da posse
+    // pelo erro de `onNotOwned` quando informado (D30)
     const em = { getRepository: jest.fn(() => repo) };
     txService = {
       findOne: jest.fn(),
       runLocked: jest.fn(
-        async (id: string, userId: string, work: (tx: unknown, m: unknown) => unknown) =>
-          work(await txService.findOne(id, userId), em),
+        async (
+          id: string,
+          userId: string,
+          work: (tx: unknown, m: unknown) => unknown,
+          opts?: RunLockedOptions,
+        ) => {
+          let tx: Transaction;
+          try {
+            tx = await txService.findOne(id, userId);
+          } catch (err) {
+            const notOwned = err instanceof NotFoundException || err instanceof ForbiddenException;
+            if (notOwned && opts?.onNotOwned) throw opts.onNotOwned();
+            throw err;
+          }
+          return work(tx, em);
+        },
       ),
     } as unknown as jest.Mocked<TransactionsService>;
     contactsService = { findOne: jest.fn().mockResolvedValue(mockContact()) };
@@ -296,18 +311,39 @@ describe('SplitsService', () => {
       expect(repo.save).not.toHaveBeenCalled();
     });
 
-    it('transação de outro usuário falha antes de validar o contato', async () => {
-      txService.findOne.mockRejectedValue(new ForbiddenException());
+    it('D30: posse da transação do body vira 400 genérico (onNotOwned no runLocked)', async () => {
+      await service.create(USER_ID, {
+        contactId: CONTACT_ID,
+        assignedAmount: 50,
+        transactionId: TX_ID,
+      });
 
-      await expect(
-        service.create(USER_ID, {
-          contactId: CONTACT_ID,
-          assignedAmount: 50,
-          transactionId: TX_ID,
-        }),
-      ).rejects.toThrow(ForbiddenException);
-      expect(repo.save).not.toHaveBeenCalled();
+      const opts = txService.runLocked.mock.calls[0][3];
+      expect(opts?.lockCard).toBeFalsy(); // splits travam só a transação
+      expect(opts?.onNotOwned?.()).toEqual(
+        new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION),
+      );
     });
+
+    it.each([
+      ['inexistente', new NotFoundException(ErrorMessages.NOT_FOUND.TRANSACTION)],
+      ['de outro usuário', new ForbiddenException(ErrorMessages.ACCESS_DENIED)],
+    ])(
+      'D30: transação %s → 400 genérico antes de validar o contato, sem gravar',
+      async (_, error) => {
+        txService.findOne.mockRejectedValue(error);
+
+        await expect(
+          service.create(USER_ID, {
+            contactId: CONTACT_ID,
+            assignedAmount: 50,
+            transactionId: TX_ID,
+          }),
+        ).rejects.toThrow(new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION));
+        expect(contactsService.findOne).not.toHaveBeenCalled();
+        expect(repo.save).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('leitura — relação contact', () => {
@@ -356,7 +392,12 @@ describe('SplitsService', () => {
         transactionId: TX_ID,
       });
 
-      expect(txService.runLocked).toHaveBeenCalledWith(TX_ID, USER_ID, expect.any(Function));
+      expect(txService.runLocked).toHaveBeenCalledWith(
+        TX_ID,
+        USER_ID,
+        expect.any(Function),
+        expect.objectContaining({ onNotOwned: expect.any(Function) }),
+      );
     });
 
     it('contato removido em paralelo (FK diferida no commit) → 400 genérico, não 500', async () => {

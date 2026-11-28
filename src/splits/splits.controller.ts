@@ -13,11 +13,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import {
+  ApiBadRequestResponse,
   ApiBearerAuth,
   ApiCreatedResponse,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiTags,
+  ApiUnprocessableEntityResponse,
 } from '@nestjs/swagger';
 import { AuthGuard } from '../auth/guards/auth.guard';
 import { TierGuard } from '../auth/guards/tier.guard';
@@ -44,6 +46,13 @@ export class SplitsController {
   @Post()
   @RequiresTier(Plan.PREMIUM)
   @ApiCreatedResponse({ type: SplitResponseDto })
+  @ApiBadRequestResponse({
+    description:
+      'Dados inválidos, ou transação/contato/item inexistente ou de outro usuário (resposta genérica, D30)',
+  })
+  @ApiUnprocessableEntityResponse({
+    description: 'Soma dos splits ultrapassa o total da transação ou do item',
+  })
   async create(@CurrentUser() user: User, @Body() dto: CreateSplitDto) {
     return SplitMapper.toDto(await this.splitsService.create(user.id, dto));
   }

@@ -227,8 +227,10 @@ export class InstallmentsService {
    * D14: depois de mudar `closingDay`/`dueDay` de um cartão, as parcelas de faturas **ainda não
    * fechadas** (data de fechamento da fatura — a maior do mês, D25 — depois de `today`) mantêm o
    * mês da fatura (mês do vencimento) e recebem as datas desse mês pelos novos dias. Faturas
-   * fechadas mantêm as datas (C4). Deve rodar na transação do chamador, **sob a trava do
-   * cartão** (`CardsService.update`). Devolve quantas parcelas foram ajustadas.
+   * fechadas mantêm as datas (C4), inclusive os meses com datas gravadas por fatura (D31: só
+   * faturas fechadas são gravadas; a gravação prevalece sobre as datas das parcelas). Deve rodar
+   * na transação do chamador, **sob a trava do cartão** (`CardsService.update`), depois da
+   * gravação D31. Devolve quantas parcelas foram ajustadas.
    */
   async rescheduleOpenInvoices(
     em: EntityManager,
@@ -242,6 +244,13 @@ export class InstallmentsService {
        FROM installments i
        JOIN transactions t ON t.id = i.transaction_id
        WHERE t.card_id = $1 AND t.user_id = $2
+         -- Defesa em profundidade (D31: mês gravado nunca é reagendado). Hoje inalcançável: só se
+         -- gravam meses fechados, e as parcelas deles já têm max(closing_date) <= hoje (HAVING)
+         AND NOT EXISTS (
+           SELECT 1 FROM card_invoice_dates d
+           WHERE d.card_id = $1 AND d.user_id = $2
+             AND d.invoice_month = to_char(i.due_date, 'YYYY-MM')
+         )
        GROUP BY 1
        HAVING max(i.closing_date) > $3::date`,
       [cardId, userId, today],

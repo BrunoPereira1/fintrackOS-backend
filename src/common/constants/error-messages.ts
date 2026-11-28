@@ -26,6 +26,9 @@ export const ErrorMessages = {
   CARD_REQUIRED_FOR_RECALC:
     'Amount and date cannot be changed because the card of this transaction was removed',
   INSTALLMENTS_REQUIRE_CARD: 'installmentsCount requires a cardId',
+  // D29: geraria parcelas de R$ 0,00
+  TOTAL_LESS_THAN_INSTALLMENTS:
+    'The total amount must be at least 0.01 per installment (total in cents >= installmentsCount)',
   // Não ecoa o valor recebido na mensagem
   INVALID_PURCHASE_DATE: 'Invalid purchase date',
   TRANSACTION_HAS_PENDING_SPLITS:
@@ -35,6 +38,9 @@ export const ErrorMessages = {
   CONTACT_HAS_SPLITS: 'Contact cannot be removed because it has splits',
   // Genérica de propósito: mesma resposta para contato inexistente ou de outro usuário
   SPLIT_INVALID_CONTACT: 'Invalid contact',
+  // D30: genéricas de propósito — mesma resposta para referência do body inexistente ou alheia
+  TRANSACTION_INVALID_CARD: 'Invalid card',
+  SPLIT_INVALID_TRANSACTION: 'Invalid transaction',
   // Integrações
   // Provedor de identidade (Firebase) fora/lento: 503 para o cliente tentar de novo
   AUTH_PROVIDER_UNAVAILABLE: 'Authentication service is temporarily unavailable, please try again',

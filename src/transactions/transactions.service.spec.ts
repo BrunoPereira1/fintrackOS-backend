@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   NotFoundException,
@@ -17,6 +18,7 @@ import { QueryFailedError } from 'typeorm';
 import { Installment } from '../installments/entities/installment.entity';
 import { ErrorMessages } from '../common/constants/error-messages';
 import { InvoiceLedgerQuery } from '../invoices/invoice-ledger.query';
+import { CardInvoiceDatesService } from '../invoices/card-invoice-dates.service';
 import {
   buildCardLedger,
   CardLedger,
@@ -38,7 +40,7 @@ const ledgerOf = (
   } = {},
 ): CardLedger =>
   buildCardLedger({
-    card: { closingDay: 10, dueDay: 17, creditLimit: 5000 },
+    card: { closingDay: 10, dueDay: 17, creditLimit: '5000.00' }, // decimal chega como string
     installments: (opts.installments ?? []).map((i, n) => ({
       id: `inst-${n + 1}`,
       transactionId: 'tx-uuid-1',
@@ -87,6 +89,7 @@ describe('TransactionsService', () => {
   let itemsRepo: { create: jest.Mock };
   let cardsService: jest.Mocked<CardsService>;
   let ledgers: { loadLedger: jest.Mock };
+  let invoiceDates: { findRecorded: jest.Mock };
   let calculator: jest.Mocked<InstallmentCalculatorService>;
 
   beforeEach(async () => {
@@ -110,6 +113,7 @@ describe('TransactionsService', () => {
       lockOwned: jest.fn().mockResolvedValue(mockCard()),
     } as unknown as jest.Mocked<CardsService>;
     ledgers = { loadLedger: jest.fn().mockResolvedValue(ledgerOf()) };
+    invoiceDates = { findRecorded: jest.fn().mockResolvedValue(new Map()) };
     calculator = { calculate: jest.fn() } as unknown as jest.Mocked<InstallmentCalculatorService>;
 
     const module: TestingModule = await Test.createTestingModule({
@@ -120,6 +124,7 @@ describe('TransactionsService', () => {
         { provide: CardsService, useValue: cardsService },
         { provide: InstallmentCalculatorService, useValue: calculator },
         { provide: InvoiceLedgerQuery, useValue: ledgers },
+        { provide: CardInvoiceDatesService, useValue: invoiceDates },
       ],
     }).compile();
 
@@ -160,7 +165,9 @@ describe('TransactionsService', () => {
         installmentsCount: 12,
       });
 
-      expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID);
+      expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID, {
+        onNotOwned: expect.any(Function),
+      });
       expect(calculator.calculate).toHaveBeenCalledWith(
         expect.objectContaining({ totalAmount: 1200, installmentsCount: 12 }),
       );
@@ -253,7 +260,9 @@ describe('TransactionsService', () => {
         cardId: 'card-uuid-1',
       });
 
-      expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID);
+      expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID, {
+        onNotOwned: expect.any(Function),
+      });
       expect(txRepo.save).toHaveBeenCalled();
     });
     describe('com cartão: sob a trava do cartão', () => {
@@ -274,12 +283,33 @@ describe('TransactionsService', () => {
         await service.create(USER_ID, Plan.INTERMEDIATE, cardPurchase);
 
         expect(txRepo.manager.transaction).toHaveBeenCalled();
-        expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID);
+        expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID, {
+          onNotOwned: expect.any(Function),
+        });
         expect(cardsService.findOne).not.toHaveBeenCalled();
         expect(em.getRepository).toHaveBeenCalledWith(Transaction);
         expect(txRepo.save).toHaveBeenCalledWith(expect.objectContaining({ installments }));
         expect(cardsService.lockOwned.mock.invocationCallOrder[0]).toBeLessThan(
           calculator.calculate.mock.invocationCallOrder[0],
+        );
+      });
+
+      it('D32: lê as datas gravadas por fatura sob a trava (mesmo em) e repassa à calculadora', async () => {
+        const recorded = new Map([
+          ['2026-04', { closingDate: '2026-03-25', dueDate: '2026-04-05' }],
+        ]);
+        invoiceDates.findRecorded.mockResolvedValue(recorded);
+        txRepo.create.mockImplementation((x) => x);
+        calculator.calculate.mockReturnValue([] as never);
+
+        await service.create(USER_ID, Plan.INTERMEDIATE, cardPurchase);
+
+        expect(invoiceDates.findRecorded).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID);
+        expect(calculator.calculate).toHaveBeenCalledWith(
+          expect.objectContaining({ purchaseDate: '2026-04-01', recordedDates: recorded }),
+        );
+        expect(cardsService.lockOwned.mock.invocationCallOrder[0]).toBeLessThan(
+          invoiceDates.findRecorded.mock.invocationCallOrder[0],
         );
       });
 
@@ -294,6 +324,89 @@ describe('TransactionsService', () => {
         );
         expect(calculator.calculate).not.toHaveBeenCalled();
         expect(txRepo.save).not.toHaveBeenCalled();
+      });
+
+      describe('D30: cardId do body inexistente ou alheio → 400 genérico', () => {
+        it('trava com onNotOwned → 400 TRANSACTION_INVALID_CARD (where id + user_id em lockOwned)', async () => {
+          txRepo.create.mockImplementation((x) => x);
+          calculator.calculate.mockReturnValue([]);
+
+          await service.create(USER_ID, Plan.INTERMEDIATE, cardPurchase);
+
+          expect(cardsService.lockOwned).toHaveBeenCalledWith(em, 'card-uuid-1', USER_ID, {
+            onNotOwned: expect.any(Function),
+          });
+          const [, , , opts] = cardsService.lockOwned.mock.calls[0];
+          expect(opts?.onNotOwned?.()).toEqual(
+            new BadRequestException(ErrorMessages.TRANSACTION_INVALID_CARD),
+          );
+        });
+
+        // lockOwned com onNotOwned não encontra a linha (inexistente, alheio, alheio e arquivado
+        // — nunca chega ao 422 CARD_ARCHIVED, que revelaria o estado) e lança o erro dele
+        it('cartão não encontrado para o usuário → 400 sem gravar', async () => {
+          cardsService.lockOwned.mockImplementation((_em, _id, _userId, opts) =>
+            Promise.reject(opts?.onNotOwned?.() ?? new Error('sem onNotOwned')),
+          );
+
+          await expect(service.create(USER_ID, Plan.INTERMEDIATE, cardPurchase)).rejects.toThrow(
+            new BadRequestException(ErrorMessages.TRANSACTION_INVALID_CARD),
+          );
+          expect(invoiceDates.findRecorded).not.toHaveBeenCalled();
+          expect(calculator.calculate).not.toHaveBeenCalled();
+          expect(txRepo.save).not.toHaveBeenCalled();
+        });
+
+        it('erro inesperado ao travar o cartão não vira 400', async () => {
+          const boom = new Error('db down');
+          cardsService.lockOwned.mockRejectedValue(boom);
+
+          await expect(service.create(USER_ID, Plan.INTERMEDIATE, cardPurchase)).rejects.toBe(boom);
+        });
+
+        it('plano insuficiente continua 403 antes de olhar o cartão', async () => {
+          await expect(service.create(USER_ID, Plan.BASIC, cardPurchase)).rejects.toThrow(
+            new ForbiddenException(ErrorMessages.PLAN_REQUIRED(Plan.INTERMEDIATE)),
+          );
+          expect(cardsService.lockOwned).not.toHaveBeenCalled();
+        });
+      });
+
+      describe('D29: total em centavos menor que o número de parcelas', () => {
+        it('R$ 0,02 em 3x → 422 sem travar o cartão nem gravar', async () => {
+          await expect(
+            service.create(USER_ID, Plan.INTERMEDIATE, { ...cardPurchase, totalAmount: 0.02 }),
+          ).rejects.toThrow(
+            new UnprocessableEntityException(ErrorMessages.TOTAL_LESS_THAN_INSTALLMENTS),
+          );
+          expect(cardsService.lockOwned).not.toHaveBeenCalled();
+          expect(calculator.calculate).not.toHaveBeenCalled();
+          expect(txRepo.save).not.toHaveBeenCalled();
+        });
+
+        it('limite: R$ 0,03 em 3x (um centavo por parcela) é aceito', async () => {
+          txRepo.create.mockImplementation((x) => x);
+          calculator.calculate.mockReturnValue([]);
+
+          await service.create(USER_ID, Plan.INTERMEDIATE, { ...cardPurchase, totalAmount: 0.03 });
+
+          expect(calculator.calculate).toHaveBeenCalledWith(
+            expect.objectContaining({ totalAmount: 0.03, installmentsCount: 3 }),
+          );
+          expect(txRepo.save).toHaveBeenCalled();
+        });
+
+        it('installmentsCount omitido no cartão conta como 1: R$ 0,01 é aceito', async () => {
+          txRepo.create.mockImplementation((x) => x);
+          calculator.calculate.mockReturnValue([]);
+          const { installmentsCount: _omit, ...upfront } = cardPurchase;
+
+          await service.create(USER_ID, Plan.INTERMEDIATE, { ...upfront, totalAmount: 0.01 });
+
+          expect(calculator.calculate).toHaveBeenCalledWith(
+            expect.objectContaining({ totalAmount: 0.01, installmentsCount: 1 }),
+          );
+        });
       });
 
       it('deadlock/serialização (40001) → 409', async () => {
@@ -447,11 +560,38 @@ describe('TransactionsService', () => {
         purchaseDate: '2026-02-20',
         installmentsCount: 3,
         card: mockCard(),
+        recordedDates: new Map(),
       });
       // o pagamento (único escritor concorrente) está serializado pela trava do cartão
       expect(em.delete).toHaveBeenCalledWith(Installment, { transactionId: 'tx-uuid-1' });
       expect(txRepo.save).toHaveBeenCalled();
       expect(result.installments).toBe(newInstallments);
+    });
+
+    it('D32: o recálculo por mudança de data recebe as datas gravadas por fatura do razão (mesmo em)', async () => {
+      const ledger = buildCardLedger({
+        card: { closingDay: 10, dueDay: 17, creditLimit: '5000.00' },
+        installments: [],
+        charges: [],
+        payments: [],
+        recordedDates: [
+          { invoiceMonth: '2026-03', closingDate: '2026-03-05', dueDate: '2026-03-12' },
+        ],
+        today: '2026-01-01',
+      });
+      ledgers.loadLedger.mockResolvedValue(ledger);
+      txRepo.findOne.mockResolvedValue(cardTx());
+      calculator.calculate.mockReturnValue(recalculated('2026-04', '2026-05', '2026-06') as never);
+
+      await service.update('tx-uuid-1', USER_ID, { date: '2026-03-06' });
+
+      expect(ledgers.loadLedger).toHaveBeenCalledWith(USER_ID, 'card-uuid-1', em);
+      expect(calculator.calculate).toHaveBeenCalledWith(
+        expect.objectContaining({ recordedDates: ledger.recordedDates }),
+      );
+      expect(Object.fromEntries(ledger.recordedDates)).toEqual({
+        '2026-03': { closingDate: '2026-03-05', dueDate: '2026-03-12' },
+      });
     });
 
     it('mudança de valor e data juntas recalcula datas e valores', async () => {
@@ -464,6 +604,40 @@ describe('TransactionsService', () => {
         expect.objectContaining({ totalAmount: 600, purchaseDate: '2026-02-20' }),
       );
       expect(em.delete).toHaveBeenCalled();
+    });
+
+    it('D29: valor e data juntos com total menor que o número de parcelas → 422 sem recalcular', async () => {
+      txRepo.findOne.mockResolvedValue(cardTx());
+
+      await expect(
+        service.update('tx-uuid-1', USER_ID, { totalAmount: 0.02, date: '2026-02-20' }),
+      ).rejects.toThrow(
+        new UnprocessableEntityException(ErrorMessages.TOTAL_LESS_THAN_INSTALLMENTS),
+      );
+      expect(calculator.calculate).not.toHaveBeenCalled();
+      expect(em.delete).not.toHaveBeenCalled();
+      expect(txRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('D29 limite: valor e data juntos com R$ 0,03 em 3x recalcula', async () => {
+      txRepo.findOne.mockResolvedValue(cardTx());
+      calculator.calculate.mockReturnValue(recalculated('2026-04', '2026-05', '2026-06') as never);
+
+      await service.update('tx-uuid-1', USER_ID, { totalAmount: 0.03, date: '2026-02-20' });
+
+      expect(calculator.calculate).toHaveBeenCalledWith(
+        expect.objectContaining({ totalAmount: 0.03, installmentsCount: 3 }),
+      );
+      expect(txRepo.save).toHaveBeenCalled();
+    });
+
+    it('D29 não se aplica a transação sem parcelas (R$ 0,01 à vista)', async () => {
+      txRepo.findOne.mockResolvedValue(mockTx());
+
+      const result = await service.update('tx-uuid-1', USER_ID, { totalAmount: 0.01 });
+
+      expect(result.totalAmount).toBe(0.01);
+      expect(txRepo.save).toHaveBeenCalled();
     });
 
     describe('D26: mudança só de valor mantém mês e datas das parcelas', () => {
@@ -496,6 +670,24 @@ describe('TransactionsService', () => {
           ['inst-3', 33.34, '2026-05-05', '2026-04-25'],
         ]);
         expect(result.totalAmount).toBe(100);
+        expect(txRepo.save).toHaveBeenCalledWith(result);
+      });
+
+      it('D29: novo total menor que o número de parcelas (R$ 0,02 em 3x) → 422 sem gravar', async () => {
+        txRepo.findOne.mockResolvedValue(stored());
+
+        await expect(service.update('tx-uuid-1', USER_ID, { totalAmount: 0.02 })).rejects.toThrow(
+          new UnprocessableEntityException(ErrorMessages.TOTAL_LESS_THAN_INSTALLMENTS),
+        );
+        expect(txRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('D29 limite: R$ 0,03 em 3x é aceito (R$ 0,01 por parcela)', async () => {
+        txRepo.findOne.mockResolvedValue(stored());
+
+        const result = await service.update('tx-uuid-1', USER_ID, { totalAmount: 0.03 });
+
+        expect(result.installments.map((i) => i.amount)).toEqual([0.01, 0.01, 0.01]);
         expect(txRepo.save).toHaveBeenCalledWith(result);
       });
 
@@ -813,6 +1005,49 @@ describe('TransactionsService', () => {
       );
     });
 
+    describe('D29: ordem das checagens na edição', () => {
+      it('órfã legada (cardId null) com R$ 0,02 em 3x → TOTAL_LESS_THAN_INSTALLMENTS, não CARD_REQUIRED_FOR_RECALC', async () => {
+        txRepo.findOne.mockResolvedValue(cardTx({ cardId: null }));
+
+        await expect(service.update('tx-uuid-1', USER_ID, { totalAmount: 0.02 })).rejects.toThrow(
+          new UnprocessableEntityException(ErrorMessages.TOTAL_LESS_THAN_INSTALLMENTS),
+        );
+        expect(txRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('compra coberta em fatura fechada (D20) + total pequeno → D29 primeiro, sem ler o razão', async () => {
+        txRepo.findOne.mockResolvedValue(cardTx());
+        ledgers.loadLedger.mockResolvedValue(
+          ledgerOf({
+            today: '2026-03-15',
+            installments: [{ dueDate: '2026-03-17', closingDate: '2026-03-10' }],
+            payments: [{}],
+          }),
+        );
+
+        await expect(service.update('tx-uuid-1', USER_ID, { totalAmount: 0.02 })).rejects.toThrow(
+          new UnprocessableEntityException(ErrorMessages.TOTAL_LESS_THAN_INSTALLMENTS),
+        );
+        expect(ledgers.loadLedger).not.toHaveBeenCalled();
+        expect(em.delete).not.toHaveBeenCalled();
+        expect(txRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('edição só de data de compra antiga já com parcelas de R$ 0,00 não é bloqueada', async () => {
+        txRepo.findOne.mockResolvedValue(cardTx({ totalAmount: '0.02' as unknown as number }));
+        calculator.calculate.mockReturnValue(
+          recalculated('2026-04', '2026-05', '2026-06') as never,
+        );
+
+        await service.update('tx-uuid-1', USER_ID, { date: '2026-02-20' });
+
+        expect(calculator.calculate).toHaveBeenCalledWith(
+          expect.objectContaining({ totalAmount: 0.02, installmentsCount: 3 }),
+        );
+        expect(txRepo.save).toHaveBeenCalled();
+      });
+    });
+
     it('rejeita novo total diferente da soma dos itens', async () => {
       txRepo.findOne.mockResolvedValue(
         cardTx({
@@ -876,6 +1111,85 @@ describe('TransactionsService', () => {
       await service.runLocked('tx-uuid-1', USER_ID, work, { lockCard: true });
 
       expect(work).toHaveBeenCalledWith(expect.anything(), em, mockCard());
+    });
+
+    describe('onNotOwned (D30: ID da transação veio do body)', () => {
+      const asBodyRef = () => new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION);
+
+      it.each([
+        ['inexistente', null],
+        ['de outro usuário', { ...mockTx(), userId: 'other-user' }],
+      ])('transação %s → erro de onNotOwned, sem executar o trabalho', async (_, found) => {
+        txRepo.findOne.mockResolvedValue(found);
+        const work = jest.fn();
+
+        await expect(
+          service.runLocked('tx-uuid-1', USER_ID, work, { onNotOwned: asBodyRef }),
+        ).rejects.toThrow(new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION));
+        expect(work).not.toHaveBeenCalled();
+      });
+
+      it('a trava filtra por id E user_id (linha alheia nunca é travada)', async () => {
+        txRepo.findOne.mockResolvedValue(mockTx());
+
+        await service.runLocked('tx-uuid-1', USER_ID, jest.fn(), { onNotOwned: asBodyRef });
+
+        expect(txRepo.findOne.mock.calls[0][0]).toEqual({
+          where: { id: 'tx-uuid-1', userId: USER_ID },
+          lock: { mode: 'pessimistic_write' },
+        });
+      });
+
+      it('com lockCard: peek e trava filtram por id E user_id; cartão antes da transação', async () => {
+        txRepo.findOne.mockResolvedValue({ ...mockTx(), cardId: 'card-uuid-1' });
+
+        await service.runLocked('tx-uuid-1', USER_ID, jest.fn(), {
+          lockCard: true,
+          onNotOwned: asBodyRef,
+        });
+
+        expect(txRepo.findOne.mock.calls[0][0]).toEqual({
+          where: { id: 'tx-uuid-1', userId: USER_ID },
+          select: { id: true, userId: true, cardId: true },
+        });
+        expect(txRepo.findOne.mock.calls[1][0]).toEqual({
+          where: { id: 'tx-uuid-1', userId: USER_ID },
+          lock: { mode: 'pessimistic_write' },
+        });
+        expect(cardsService.lockOwned.mock.invocationCallOrder[0]).toBeLessThan(
+          txRepo.findOne.mock.invocationCallOrder[1],
+        );
+      });
+
+      it('com lockCard e transação não encontrada para o usuário → erro de onNotOwned, sem travar cartão', async () => {
+        txRepo.findOne.mockResolvedValue(null);
+
+        await expect(
+          service.runLocked('tx-uuid-1', USER_ID, jest.fn(), {
+            lockCard: true,
+            onNotOwned: asBodyRef,
+          }),
+        ).rejects.toThrow(new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION));
+        expect(cardsService.lockOwned).not.toHaveBeenCalled();
+      });
+
+      it('erro lançado pelo trabalho não é convertido', async () => {
+        txRepo.findOne.mockResolvedValue(mockTx());
+        const inner = new NotFoundException(ErrorMessages.NOT_FOUND.SPLIT);
+
+        await expect(
+          service.runLocked('tx-uuid-1', USER_ID, () => Promise.reject(inner), {
+            onNotOwned: asBodyRef,
+          }),
+        ).rejects.toBe(inner);
+      });
+
+      it('sem onNotOwned continua 404/403 (recurso da rota)', async () => {
+        txRepo.findOne.mockResolvedValue(null);
+        await expect(service.runLocked('tx-uuid-1', USER_ID, jest.fn())).rejects.toThrow(
+          new NotFoundException(ErrorMessages.NOT_FOUND.TRANSACTION),
+        );
+      });
     });
   });
 

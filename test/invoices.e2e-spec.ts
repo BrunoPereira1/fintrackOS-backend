@@ -11,6 +11,7 @@ import { DataSource } from 'typeorm';
 import { DatabaseModule } from '../src/database/database.module';
 import { Clock } from '../src/common/clock';
 import { ClockModule } from '../src/common/clock.module';
+import { isForeignKeyViolation } from '../src/common/db-errors';
 import { CardsModule } from '../src/cards/cards.module';
 import { CardsService } from '../src/cards/cards.service';
 import { CardInvoicesService } from '../src/cards/card-invoices.service';
@@ -303,7 +304,7 @@ describe('Faturas: pagamentos, encargos e cartões (e2e, banco real)', () => {
       if (batchUser) await db.getRepository(User).delete(batchUser.id);
     });
 
-    it('3 cartões com parcelas, encargos e pagamentos: 4 consultas, formatos aceitos pela calculadora', async () => {
+    it('3 cartões com parcelas, encargos e pagamentos: 5 consultas, formatos aceitos pela calculadora', async () => {
       batchUser = await newUser();
       const saved: CreditCard[] = [];
       for (const limit of [1000, 2000, 0]) saved.push(await newCard(batchUser, limit));
@@ -325,7 +326,8 @@ describe('Faturas: pagamentos, encargos e cartões (e2e, banco real)', () => {
 
       const spy = jest.spyOn(db, 'query');
       const result = await ledgers.loadLedgers(batchUser.id);
-      expect(spy).toHaveBeenCalledTimes(4);
+      // cartões + parcelas + encargos + pagamentos + datas gravadas por fatura (D31)
+      expect(spy).toHaveBeenCalledTimes(5);
       spy.mockRestore();
 
       expect(result.size).toBe(3);
@@ -355,6 +357,52 @@ describe('Faturas: pagamentos, encargos e cartões (e2e, banco real)', () => {
       spy2.mockRestore();
       expect(listed.map((c) => c.availableLimit).sort()).toEqual([1820, 920, null].sort());
     });
+  });
+
+  describe('integridade no banco: o cartão do lançamento pertence ao mesmo usuário', () => {
+    const inserts = {
+      invoice_payments: (userId: string, cardId: string) =>
+        db.query(
+          `INSERT INTO invoice_payments (user_id, card_id, invoice_month, amount, paid_on)
+           VALUES ($1, $2, '2026-03', 10, '2026-03-15')`,
+          [userId, cardId],
+        ),
+      invoice_charges: (userId: string, cardId: string) =>
+        db.query(
+          `INSERT INTO invoice_charges (user_id, card_id, invoice_month, amount, description)
+           VALUES ($1, $2, '2026-03', 10, 'IOF')`,
+          [userId, cardId],
+        ),
+    };
+
+    it.each([
+      ['invoice_payments', 'FK_invoice_payments_card'],
+      ['invoice_charges', 'FK_invoice_charges_card'],
+    ] as const)(
+      '%s: cartão de um usuário com user_id de outro → 23503 em %s; par correto → ok',
+      async (table, fk) => {
+        const mine = await newCard(user);
+        const theirs = await newCard(other);
+
+        for (const [userId, cardId] of [
+          [other.id, mine.id],
+          [user.id, theirs.id],
+        ]) {
+          const err: unknown = await inserts[table](userId, cardId).then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+          expect(isForeignKeyViolation(err, fk)).toBe(true);
+        }
+
+        await expect(inserts[table](user.id, mine.id)).resolves.toBeDefined();
+        const [{ n }] = await db.query(
+          `SELECT count(*)::int AS n FROM ${table} WHERE card_id = ANY($1)`,
+          [[mine.id, theirs.id]],
+        );
+        expect(n).toBe(1);
+      },
+    );
   });
 
   describe('concorrência', () => {

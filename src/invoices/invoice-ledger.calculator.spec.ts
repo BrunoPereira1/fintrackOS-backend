@@ -5,8 +5,10 @@ import {
   cardBalance,
   CardLedger,
   CardLedgerInput,
+  closedInvoiceDatesToRecord,
   currentOpenInvoiceMonth,
   hasCoveredInstallmentInClosedInvoice,
+  invoiceDatesOf,
   installmentStates,
   installmentsFallInClosedInvoice,
   LedgerCardInput,
@@ -932,6 +934,279 @@ describe('invoice-ledger.calculator', () => {
       const l = ledger({ today: '2026-03-25' });
       expect(installmentsFallInClosedInvoice(l, [])).toBe(false);
       expect(() => installmentsFallInClosedInvoice(l, [{ dueDate: '2026-04' }])).toThrow(/dueDate/);
+    });
+  });
+
+  describe('D31: datas gravadas por fatura (card_invoice_dates)', () => {
+    // Cartão mudou de "fecha 25, vence 5" (CARD) para "fecha 28, vence 10"; hoje 27/11/2026.
+    // A fatura 2026-12 fechou em 25/11 e foi gravada antes da mudança.
+    const NEW_CARD: LedgerCardInput = { closingDay: 28, dueDay: 10, creditLimit: '1000.00' };
+    const DEC = { invoiceMonth: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' };
+    const newLedger = (input: Partial<CardLedgerInput> & { today: string }) =>
+      ledger({ card: NEW_CARD, recordedDates: [DEC], ...input });
+
+    it('precedência: gravada por fatura → parcelas do mês → dias atuais do cartão', () => {
+      const l = newLedger({
+        today: '2026-11-27',
+        installments: [
+          // parcela legada no mês gravado, com datas divergentes: a gravada por fatura vence
+          inst('dec', '2026-12', '10.00', { closingDate: '2026-11-28', dueDate: '2026-12-10' }),
+          inst('jan', '2027-01', '10.00', {}, NEW_CARD),
+          inst('feb', '2027-02', '10.00', { closingDate: '2027-01-27' }, NEW_CARD),
+        ],
+      });
+      expect(invoiceDatesOf(l, '2026-12')).toEqual({
+        closingDate: '2026-11-25',
+        dueDate: '2026-12-05',
+      });
+      // sem gravação por fatura: as datas gravadas nas parcelas (não os dias do cartão)
+      expect(invoiceDatesOf(l, '2027-02')).toEqual({
+        closingDate: '2027-01-27',
+        dueDate: '2027-02-10',
+      });
+      expect(invoiceDatesOf(l, '2027-03')).toEqual(invoiceDates('2027-03', NEW_CARD));
+      expect(l.recordedDates.get('2026-12')).toEqual({
+        closingDate: '2026-11-25',
+        dueDate: '2026-12-05',
+      });
+      expect(l.recordedDates.has('2027-01')).toBe(false);
+    });
+
+    it('fatura gravada sem itens continua fechada (não reabre pelos dias novos)', () => {
+      const view = buildInvoiceView(newLedger({ today: '2026-11-27' }), '2026-12');
+      expect(view).toMatchObject({
+        closingDate: '2026-11-25',
+        dueDate: '2026-12-05',
+        status: 'closed',
+      });
+      // sem a gravação, os dias novos (fecha 28/11) fariam a fatura parecer aberta
+      const without = buildInvoiceView(ledger({ card: NEW_CARD, today: '2026-11-27' }), '2026-12');
+      expect(without.status).toBe('open');
+    });
+
+    it('D9: a aberta atual é a seguinte à gravada; a gravada (fechada) também aceita', () => {
+      const l = newLedger({ today: '2026-11-27' });
+      expect(currentOpenInvoiceMonth(l)).toBe('2027-01');
+      expect(acceptsInvoiceEntries(l, '2026-12')).toBe(true);
+      expect(acceptsInvoiceEntries(l, '2027-01')).toBe(true);
+      expect(acceptsInvoiceEntries(l, '2027-02')).toBe(false);
+    });
+
+    it('D24 usa o fechamento gravado da fatura de destino', () => {
+      const l = newLedger({ today: '2026-11-27' });
+      expect(installmentsFallInClosedInvoice(l, [{ dueDate: '2026-12-05' }])).toBe(true);
+      expect(installmentsFallInClosedInvoice(l, [{ dueDate: '2027-01-10' }])).toBe(false);
+    });
+
+    it('vencida e saldo anterior (D10) usam o vencimento gravado', () => {
+      const l = newLedger({
+        today: '2026-12-07', // depois do vencimento gravado (05/12), antes do novo (10/12)
+        installments: [
+          inst('dec', '2026-12', '10.00', { closingDate: '2026-11-25', dueDate: '2026-12-05' }),
+        ],
+      });
+      expect(installmentStates(l).get('dec')?.status).toBe('overdue');
+      expect(buildInvoiceView(l, '2026-12').status).toBe('unpaid');
+      expect(buildInvoiceView(l, '2027-01').previousBalance).toBe(10);
+    });
+
+    it('encargo em mês gravado vence pelo vencimento gravado (05/12), não pelo dos dias novos (10/12)', () => {
+      const l = newLedger({ today: '2026-12-07', charges: [charge('ch', '2026-12', '7.50')] });
+      const view = buildInvoiceView(l, '2026-12');
+      expect(view.dueDate).toBe('2026-12-05');
+      expect(view.charges).toEqual([
+        expect.objectContaining({ id: 'ch', status: 'overdue', remainingAmount: 7.5 }),
+      ]);
+      expect(view.status).toBe('unpaid');
+      // sem a gravação (vence 10/12 pelos dias novos) o mesmo encargo ainda estaria pendente
+      const without = ledger({
+        card: NEW_CARD,
+        today: '2026-12-07',
+        charges: [charge('ch', '2026-12', '7.50')],
+      });
+      expect(buildInvoiceView(without, '2026-12').charges[0].status).toBe('pending');
+    });
+
+    it('paidLate usa o vencimento gravado: pago em 07/12 (gravada vence 05/12, dias novos 10/12)', () => {
+      const l = newLedger({
+        today: '2026-12-08',
+        payments: [
+          pay('late', '2026-12', '5.00', '2026-12-07'),
+          pay('ok', '2026-12', '5.00', '2026-12-05'),
+        ],
+      });
+      const byId = Object.fromEntries(
+        buildInvoiceView(l, '2026-12').payments.map((p) => [p.id, p.paidLate]),
+      );
+      expect(byId).toEqual({ late: true, ok: false });
+      const without = ledger({
+        card: NEW_CARD,
+        today: '2026-12-08',
+        payments: [pay('late', '2026-12', '5.00', '2026-12-07')],
+      });
+      expect(buildInvoiceView(without, '2026-12').payments[0].paidLate).toBe(false);
+    });
+
+    it('D20: parcela coberta em fatura gravada (fechada) é detectada', () => {
+      const l = newLedger({
+        today: '2026-11-27',
+        installments: [
+          // gravada nas parcelas pelos dias novos (fecha 28/11, ainda aberta), mas a fatura fechou
+          inst('dec', '2026-12', '10.00', {
+            transactionId: 'tx',
+            closingDate: '2026-11-28',
+            dueDate: '2026-12-10',
+          }),
+        ],
+        payments: [pay('p', '2026-12', '10.00')],
+      });
+      expect(hasCoveredInstallmentInClosedInvoice(l, 'tx')).toBe(true);
+    });
+
+    it.each([
+      ['invoiceMonth', { ...DEC, invoiceMonth: '2026-13' }, /recorded\.invoiceMonth/],
+      ['closingDate', { ...DEC, closingDate: '2026-11-25T00:00' }, /recorded\.closingDate/],
+      ['dueDate', { ...DEC, dueDate: new Date() as unknown as string }, /recorded\.dueDate/],
+    ])('formato inválido em %s lança', (_label, recorded, message) => {
+      expect(() => ledger({ today: '2026-11-27', recordedDates: [recorded] })).toThrow(message);
+    });
+
+    it('sem recordedDates: mapa vazio (comportamento anterior)', () => {
+      expect(ledger({ today: '2026-11-27' }).recordedDates.size).toBe(0);
+    });
+  });
+
+  describe('D31: closedInvoiceDatesToRecord (snapshot antes de mudar os dias)', () => {
+    // Pelos dias atuais (antigos) do cartão: fecha 25, vence 5. Hoje 27/11/2026.
+    // Dias novos (salvo indicação): fecha 28, vence 10.
+    const TODAY = '2026-11-27';
+    const NEW_DAYS = { closingDay: 28, dueDay: 10 };
+
+    it('grava os meses fechados com parcela, encargo ou pagamento, pelas datas vigentes (D25)', () => {
+      const l = ledger({
+        today: TODAY,
+        installments: [
+          // datas gravadas na parcela (dias mais antigos) prevalecem sobre os dias do cartão
+          inst('oct', '2026-10', '10.00', { closingDate: '2026-09-24' }),
+          inst('dec', '2026-12', '10.00'),
+          inst('jan', '2027-01', '10.00'), // aberta (fecha 25/12): não grava
+        ],
+        charges: [charge('c', '2026-11', '5.00')],
+        payments: [pay('p', '2026-09', '5.00')],
+      });
+      expect(closedInvoiceDatesToRecord(l, NEW_DAYS)).toEqual([
+        { month: '2026-09', closingDate: '2026-08-25', dueDate: '2026-09-05' },
+        { month: '2026-10', closingDate: '2026-09-24', dueDate: '2026-10-05' },
+        { month: '2026-11', closingDate: '2026-10-25', dueDate: '2026-11-05' },
+        { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+      ]);
+    });
+
+    it('não repete mês já gravado (nem com datas diferentes)', () => {
+      const l = ledger({
+        today: TODAY,
+        installments: [inst('oct', '2026-10', '10.00'), inst('dec', '2026-12', '10.00')],
+        recordedDates: [
+          { invoiceMonth: '2026-10', closingDate: '2026-09-20', dueDate: '2026-10-01' },
+          { invoiceMonth: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+        ],
+      });
+      expect(closedInvoiceDatesToRecord(l, NEW_DAYS)).toEqual([]);
+    });
+
+    it('grava a fatura fechada mais recente mesmo vazia (pelos dias atuais)', () => {
+      expect(closedInvoiceDatesToRecord(ledger({ today: TODAY }), NEW_DAYS)).toEqual([
+        { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+      ]);
+      // véspera do fechamento de 2026-12: a mais recente fechada é 2026-11
+      expect(closedInvoiceDatesToRecord(ledger({ today: '2026-11-24' }), NEW_DAYS)).toEqual([
+        { month: '2026-11', closingDate: '2026-10-25', dueDate: '2026-11-05' },
+      ]);
+    });
+
+    it('cartão que vence no mesmo mês do fechamento (fecha 5, vence 15)', () => {
+      const l = ledger({
+        card: { closingDay: 5, dueDay: 15, creditLimit: 0 },
+        today: TODAY,
+        payments: [pay('p', '2026-12', '1.00')], // 2026-12 fecha 05/12: aberta, não grava
+      });
+      expect(closedInvoiceDatesToRecord(l, NEW_DAYS)).toEqual([
+        { month: '2026-11', closingDate: '2026-11-05', dueDate: '2026-11-15' },
+      ]);
+    });
+
+    it('fechamento no dia de hoje conta como fechada', () => {
+      const l = ledger({ today: '2026-11-25', installments: [inst('dec', '2026-12', '1.00')] });
+      expect(closedInvoiceDatesToRecord(l, NEW_DAYS)).toEqual([
+        { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+      ]);
+    });
+
+    describe('mês fechado que reabriria pelos dias novos (gravado mesmo vazio)', () => {
+      // Cenário do business-rules §5: fecha 25/vence 5, hoje 26/11/2026; 2026-11 (fechou 25/10)
+      // vazia, 2026-12 (fechou 25/11) com compra. Dias novos: fecha 27, vence 28 — a 2026-11
+      // fecharia em 27/11 (> hoje), reabrindo.
+      const T = '2026-11-26';
+      const NEW = { closingDay: 27, dueDay: 28 };
+      const before = () => ledger({ today: T, installments: [inst('dec', '2026-12', '10.00')] });
+
+      it('grava a 2026-11 vazia (25/10, 05/11) além da 2026-12', () => {
+        expect(closedInvoiceDatesToRecord(before(), NEW)).toEqual([
+          { month: '2026-11', closingDate: '2026-10-25', dueDate: '2026-11-05' },
+          { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+        ]);
+      });
+
+      it('depois da gravação, com os dias novos: 2026-11 continua fechada e D9 aponta 2027-01', () => {
+        const recordedDates = closedInvoiceDatesToRecord(before(), NEW).map(
+          ({ month, ...dates }) => ({ invoiceMonth: month, ...dates }),
+        );
+        const after = ledger({
+          card: { ...NEW, creditLimit: '1000.00' },
+          today: T,
+          installments: [inst('dec', '2026-12', '10.00')],
+          recordedDates,
+        });
+        expect(buildInvoiceView(after, '2026-11').status).toBe('closed');
+        expect(currentOpenInvoiceMonth(after)).toBe('2027-01');
+        expect(acceptsInvoiceEntries(after, '2027-01')).toBe(true);
+        // sem gravar a 2026-11, ela reabriria (fecha 27/11) e seria a "aberta atual"
+        const withoutNov = ledger({
+          card: { ...NEW, creditLimit: '1000.00' },
+          today: T,
+          installments: [inst('dec', '2026-12', '10.00')],
+          recordedDates: recordedDates.filter((r) => r.invoiceMonth !== '2026-11'),
+        });
+        expect(currentOpenInvoiceMonth(withoutNov)).toBe('2026-11');
+      });
+
+      it('mês fechado vazio que continua fechado pelos dias novos não é gravado', () => {
+        // dias novos "fecha 20, vence 5": 2026-11 fecharia em 20/10 (≤ hoje) — não reabre
+        expect(closedInvoiceDatesToRecord(before(), { closingDay: 20, dueDay: 5 })).toEqual([
+          { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+        ]);
+      });
+
+      it('mês ainda aberto pelas datas vigentes não é gravado (mesmo que os dias novos o fechem)', () => {
+        // 2027-01 fecha 25/12 (aberta); dias novos "fecha 1, vence 10": fecharia 01/01 — aberta
+        // e, de qualquer forma, só se grava o que já está fechado
+        expect(closedInvoiceDatesToRecord(before(), { closingDay: 1, dueDay: 10 })).toEqual([
+          { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+        ]);
+      });
+
+      it('mês já gravado não é regravado', () => {
+        const l = ledger({
+          today: T,
+          installments: [inst('dec', '2026-12', '10.00')],
+          recordedDates: [
+            { invoiceMonth: '2026-11', closingDate: '2026-10-20', dueDate: '2026-11-01' },
+          ],
+        });
+        expect(closedInvoiceDatesToRecord(l, NEW)).toEqual([
+          { month: '2026-12', closingDate: '2026-11-25', dueDate: '2026-12-05' },
+        ]);
+      });
     });
   });
 

@@ -8,6 +8,7 @@ import {
   LedgerChargeInput,
   LedgerInstallmentInput,
   LedgerPaymentInput,
+  LedgerRecordedDatesInput,
 } from './invoice-ledger.calculator';
 
 export interface LoadLedgersOptions {
@@ -56,9 +57,18 @@ const PAYMENTS_SQL = `
   FROM invoice_payments p
   WHERE p.user_id = $1 AND ($2::uuid[] IS NULL OR p.card_id = ANY($2::uuid[]))`;
 
+// D31: datas gravadas por fatura (precedência sobre as parcelas e os dias do cartão). Exportada
+// para `CardInvoiceDatesService.findRecorded` (D32) usar a mesma consulta.
+export const RECORDED_DATES_SQL = `
+  SELECT d.card_id AS "cardId", d.invoice_month AS "invoiceMonth",
+         ${DATE('d.closing_date')} AS "closingDate", ${DATE('d.due_date')} AS "dueDate"
+  FROM card_invoice_dates d
+  WHERE d.user_id = $1 AND ($2::uuid[] IS NULL OR d.card_id = ANY($2::uuid[]))`;
+
 /**
  * Leitura do razão dos cartões (spec 2026-11-24-modelo-de-pagamento §2/§5): carga **em lote por
- * usuário** — cartões + 3 consultas (parcelas de transações com cartão, encargos, pagamentos) —,
+ * usuário** — cartões + 4 consultas (parcelas de transações com cartão, encargos, pagamentos,
+ * datas gravadas por fatura — D31) —,
  * agrupada por cartão e montada com `buildCardLedger` e o "hoje" do `Clock`. Exceção de leitura
  * agregada (architecture.md): lê tabelas de outros domínios via SQL, sempre por `user_id`.
  * Parcelas órfãs (transação sem cartão) ficam fora do razão (D18).
@@ -88,6 +98,10 @@ export class InvoiceLedgerQuery {
     );
     const charges: Row<LedgerChargeInput>[] = await runner.query(CHARGES_SQL, params);
     const payments: Row<LedgerPaymentInput>[] = await runner.query(PAYMENTS_SQL, params);
+    const recorded: Row<LedgerRecordedDatesInput>[] = await runner.query(
+      RECORDED_DATES_SQL,
+      params,
+    );
 
     const today = opts.today ?? this.clock.today();
     for (const { id, closingDay, dueDay, creditLimit } of cards) {
@@ -98,6 +112,7 @@ export class InvoiceLedgerQuery {
           installments: installments.filter((r) => r.cardId === id),
           charges: charges.filter((r) => r.cardId === id),
           payments: payments.filter((r) => r.cardId === id),
+          recordedDates: recorded.filter((r) => r.cardId === id),
           today,
         }),
       );

@@ -5,6 +5,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { DataSource } from 'typeorm';
 import { DatabaseModule } from '../src/database/database.module';
 import { ClockModule } from '../src/common/clock.module';
+import { ErrorMessages } from '../src/common/constants/error-messages';
 import { SplitsModule } from '../src/splits/splits.module';
 import { SplitsService } from '../src/splits/splits.service';
 import { SplitMapper } from '../src/splits/split.mapper';
@@ -132,6 +133,28 @@ describe('Contatos e splits (e2e, banco real)', () => {
       splits.create(user.id, { contactId: foreign.id, assignedAmount: 10, transactionId: tx.id }),
     ).rejects.toThrow(BadRequestException);
     expect(await splits.findAllByTransaction(tx.id, user.id)).toEqual([]);
+  });
+
+  it('D30: split em transação de outro usuário ou inexistente → 400 genérico, nada gravado', async () => {
+    const contact = await contacts.create(user.id, { name: 'Meu contato' });
+    const foreignTx = await newTx(otherUser.id);
+    const invalidTx = new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION);
+
+    await expect(
+      splits.create(user.id, {
+        contactId: contact.id,
+        assignedAmount: 10,
+        transactionId: foreignTx.id,
+      }),
+    ).rejects.toThrow(invalidTx);
+    await expect(
+      splits.create(user.id, {
+        contactId: contact.id,
+        assignedAmount: 10,
+        transactionId: randomUUID(),
+      }),
+    ).rejects.toThrow(invalidTx);
+    expect(await splits.findAllByTransaction(foreignTx.id, otherUser.id)).toEqual([]);
   });
 
   it('?transactionId= alheio ou inexistente → lista vazia (filtro não revela existência)', async () => {

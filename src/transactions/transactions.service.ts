@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -25,6 +26,7 @@ import { SplitStatus } from '../splits/entities/cost-split.entity';
 import { CreditCard } from '../cards/entities/credit-card.entity';
 import { mapTransactionConflict } from '../common/db-errors';
 import { InvoiceLedgerQuery } from '../invoices/invoice-ledger.query';
+import { CardInvoiceDatesService } from '../invoices/card-invoice-dates.service';
 import {
   hasCoveredInstallmentInClosedInvoice,
   installmentsFallInClosedInvoice,
@@ -38,6 +40,13 @@ export interface RunLockedOptions {
    * cartão → transação (architecture.md). Obrigatório em edição/exclusão de compra no cartão.
    */
   lockCard?: boolean;
+  /**
+   * D30: o ID da transação veio do **body** (ex.: `transactionId` em `POST /splits`) —
+   * inexistente ou de outro usuário lança este erro (400 genérico) em vez de 404/403. A leitura e
+   * a trava filtram por `id` **e** `user_id` (a linha alheia nunca é travada). Só a checagem de
+   * posse é convertida; erros do `work` passam intactos.
+   */
+  onNotOwned?: () => Error;
 }
 
 export interface PaginatedResult<T> {
@@ -59,6 +68,7 @@ export class TransactionsService {
     private readonly cardsService: CardsService,
     private readonly calculator: InstallmentCalculatorService,
     private readonly ledgers: InvoiceLedgerQuery,
+    private readonly invoiceDates: CardInvoiceDatesService,
   ) {}
 
   async create(userId: string, userPlan: Plan, dto: CreateTransactionDto): Promise<Transaction> {
@@ -77,6 +87,9 @@ export class TransactionsService {
       throw new UnprocessableEntityException(ErrorMessages.INSTALLMENTS_REQUIRE_CARD);
     }
 
+    // D29: compra no cartão sempre tem parcelas (à vista = 1); sem cartão é 1x e total ≥ 0,01
+    if (cardId) assertTotalCoversInstallments(dto.totalAmount, installmentsCount ?? 1);
+
     const build = (installments?: DeepPartial<Installment>[]) =>
       this.transactionsRepo.create({
         ...txData,
@@ -90,15 +103,19 @@ export class TransactionsService {
     const saved = cardId
       ? await this.inTransaction(async (em) => {
           // Sob a trava do cartão: arquivamento e mudança de dias (D14) não correm em paralelo
-          const card = await this.cardsService.lockOwned(em, cardId, userId);
+          // D30: posse antes do arquivamento — alheio e arquivado é 400, nunca 422
+          const card = await this.lockBodyCard(em, cardId, userId);
           if (card.archivedAt) throw new UnprocessableEntityException(ErrorMessages.CARD_ARCHIVED);
           // Toda compra no cartão gera parcelas — à vista é 1 parcela — para entrar na fatura;
-          // cada parcela já traz `closingDate` (D14) pelos dias atuais do cartão
+          // cada parcela já traz `closingDate` (D14) pelos dias atuais do cartão, exceto em mês
+          // com datas gravadas por fatura (D31/D32, lidas sob a trava)
+          const recordedDates = await this.invoiceDates.findRecorded(em, card.id, userId);
           const installments = this.calculator.calculate({
             totalAmount: dto.totalAmount,
             installmentsCount: installmentsCount ?? 1,
             purchaseDate: dto.date,
             card,
+            recordedDates,
           });
           return em.getRepository(Transaction).save(build(installments));
         })
@@ -157,20 +174,22 @@ export class TransactionsService {
     work: (tx: Transaction, em: EntityManager, card?: CreditCard) => Promise<T>,
     opts: RunLockedOptions = {},
   ): Promise<T> {
+    // D30: ID do body → filtra também por user_id, para nunca travar a linha de outro usuário
+    const where = opts.onNotOwned ? { id, userId } : { id };
     return this.inTransaction(async (em) => {
       const repo = em.getRepository(Transaction);
       let card: CreditCard | undefined;
       if (opts.lockCard) {
         const peek = await repo.findOne({
-          where: { id },
+          where,
           select: { id: true, userId: true, cardId: true },
         });
-        this.assertOwned(peek, userId);
+        this.assertOwned(peek, userId, opts.onNotOwned);
         if (peek.cardId) card = await this.cardsService.lockOwned(em, peek.cardId, userId);
       }
       // FOR UPDATE não pode ir junto de LEFT JOIN no Postgres: trava primeiro, carrega depois
-      const locked = await repo.findOne({ where: { id }, lock: { mode: 'pessimistic_write' } });
-      this.assertOwned(locked, userId);
+      const locked = await repo.findOne({ where, lock: { mode: 'pessimistic_write' } });
+      this.assertOwned(locked, userId, opts.onNotOwned);
       if (opts.lockCard && (locked.cardId ?? undefined) !== card?.id) {
         // Defesa: hoje `cardId` é imutável e cartão não é apagado (D12), então não deveria
         // acontecer; se o cartão travado não for mais o da transação, o cliente tenta de novo
@@ -181,14 +200,31 @@ export class TransactionsService {
     });
   }
 
+  /**
+   * D30: `cardId` do body — `lockOwned` com `onNotOwned`: a trava filtra por `id` e `user_id`
+   * (cartão alheio nunca é travado) e inexistente ou alheio respondem o mesmo 400 genérico, para
+   * não virar oráculo de IDs.
+   */
+  private lockBodyCard(em: EntityManager, cardId: string, userId: string): Promise<CreditCard> {
+    return this.cardsService.lockOwned(em, cardId, userId, {
+      onNotOwned: () => new BadRequestException(ErrorMessages.TRANSACTION_INVALID_CARD),
+    });
+  }
+
   /** Transação de banco com deadlock/serialização convertidos em 409. */
   private inTransaction<T>(work: (em: EntityManager) => Promise<T>): Promise<T> {
     return mapTransactionConflict(() => this.transactionsRepo.manager.transaction(work));
   }
 
-  private assertOwned(tx: Transaction | null, userId: string): asserts tx is Transaction {
+  private assertOwned(
+    tx: Transaction | null,
+    userId: string,
+    onNotOwned?: () => Error,
+  ): asserts tx is Transaction {
+    if (tx && tx.userId === userId) return;
+    if (onNotOwned) throw onNotOwned();
     if (!tx) throw new NotFoundException(ErrorMessages.NOT_FOUND.TRANSACTION);
-    if (tx.userId !== userId) throw new ForbiddenException(ErrorMessages.ACCESS_DENIED);
+    throw new ForbiddenException(ErrorMessages.ACCESS_DENIED);
   }
 
   private async findOwned(id: string, userId: string, relations: string[]): Promise<Transaction> {
@@ -214,7 +250,8 @@ export class TransactionsService {
    * - compra no cartão, sob a trava cartão → transação: bloqueada (422) se alguma parcela coberta
    *   já está em fatura fechada (D20). Mudança só de **valor** (D26) mantém mês e datas gravados
    *   das parcelas e redistribui os valores; mudança de **data** recalcula as parcelas pelos dias
-   *   **atuais** do cartão, trocando-as numa única transação de banco, e é bloqueada (422) se
+   *   **atuais** do cartão (respeitando as datas gravadas por fatura — D32), trocando-as numa
+   *   única transação de banco, e é bloqueada (422) se
    *   alguma cair em fatura fechada (D24). Cartão arquivado também edita (D12).
    */
   async update(id: string, userId: string, dto: UpdateTransactionDto): Promise<Transaction> {
@@ -235,6 +272,10 @@ export class TransactionsService {
           const splitsCents = sumCents(tx.splits, (s) => toCents(s.assignedAmount));
           if (splitsCents > toCents(newTotal)) {
             throw new UnprocessableEntityException(ErrorMessages.SPLITS_EXCEED_TOTAL);
+          }
+          // D29 (só valor — D26 — ou com data): installmentsCount é imutável
+          if (tx.installments?.length) {
+            assertTotalCoversInstallments(newTotal, tx.installments.length);
           }
         }
 
@@ -269,6 +310,8 @@ export class TransactionsService {
           installmentsCount: tx.installments[0].totalInstallments,
           purchaseDate: (dto.date as string).slice(0, 10),
           card,
+          // D32: datas gravadas por fatura (D31), do razão lido sob a trava
+          recordedDates: ledger.recordedDates,
         });
 
         // D24: nova data não põe parcela em fatura já fechada (o destino é protegido). Tirar
@@ -336,6 +379,16 @@ function assertPaymentMethodChange(tx: Transaction, requested: PaymentMethod): v
     (tx.installments?.length ?? 0) > 0;
   if (isCardPurchase || requested === PaymentMethod.CREDIT_CARD) {
     throw new UnprocessableEntityException(ErrorMessages.PAYMENT_METHOD_CHANGE_NOT_ALLOWED);
+  }
+}
+
+/**
+ * D29: o total precisa dar ao menos 1 centavo por parcela — senão haveria parcela de R$ 0,00
+ * (ex.: R$ 0,02 em 3x). Total em centavos == número de parcelas é aceito.
+ */
+function assertTotalCoversInstallments(totalAmount: number | string, count: number): void {
+  if (toCents(totalAmount) < count) {
+    throw new UnprocessableEntityException(ErrorMessages.TOTAL_LESS_THAN_INSTALLMENTS);
   }
 }
 

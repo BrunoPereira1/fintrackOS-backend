@@ -33,11 +33,15 @@ export class SplitsService {
   /**
    * Cria o split com a transação travada (`TransactionsService.runLocked`): a checagem
    * "Σ splits ≤ total" e o insert ficam atômicos frente a outros splits e à edição do total.
+   * D30: `transactionId` vem do body — inexistente ou alheia → 400 genérico (`onNotOwned`).
    */
   async create(userId: string, dto: CreateSplitDto): Promise<CostSplit> {
     try {
-      return await this.transactionsService.runLocked(dto.transactionId, userId, (tx, em) =>
-        this.createLocked(userId, dto, tx, em.getRepository(CostSplit)),
+      return await this.transactionsService.runLocked(
+        dto.transactionId,
+        userId,
+        (tx, em) => this.createLocked(userId, dto, tx, em.getRepository(CostSplit)),
+        { onNotOwned: () => new BadRequestException(ErrorMessages.SPLIT_INVALID_TRANSACTION) },
       );
     } catch (err) {
       // Contato removido entre a validação e o commit: a FK diferida falha no COMMIT

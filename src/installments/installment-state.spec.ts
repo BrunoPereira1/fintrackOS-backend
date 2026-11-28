@@ -147,6 +147,25 @@ describe('installment-state', () => {
       expect(listingCoverage(new Map([['card-1', ledger]])).pastDue).toEqual([]);
     });
 
+    it('D31: pastDue usa o vencimento gravado por fatura, não o das parcelas', () => {
+      // Parcela de mar gravada pelos dias novos (vence 20/03), mas a fatura 2026-03 tem datas
+      // gravadas (fechou 05/03, venceu 12/03): hoje 15/03 ela já está vencida
+      const ledger = buildCardLedger({
+        card: { closingDay: 13, dueDay: 20, creditLimit: 1000 },
+        installments: [inst({ id: 'm', dueDate: '2026-03-20', closingDate: '2026-03-13' })],
+        charges: [],
+        payments: [],
+        recordedDates: [
+          { invoiceMonth: '2026-03', closingDate: '2026-03-05', dueDate: '2026-03-12' },
+        ],
+        today: TODAY,
+      });
+      expect(listingCoverage(new Map([['card-1', ledger]])).pastDue).toEqual([
+        { cardId: 'card-1', month: '2026-03' },
+      ]);
+      expect(installmentStates(ledger).get('m')?.status).toBe('overdue');
+    });
+
     it('sem parcela totalmente coberta não há limiar para o cartão', () => {
       const ledger = ledgerOf(['99.99'], installments);
       expect(listingCoverage(new Map([['card-1', ledger]])).covered).toEqual([]);

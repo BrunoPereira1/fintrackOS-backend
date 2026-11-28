@@ -11,7 +11,8 @@
  * - Fatura `M` = mês do vencimento. Item de dívida: parcela (mês de `dueDate`) ou encargo
  *   (`invoiceMonth`). `P` = Σ de todos os pagamentos; item coberto ⇔ soma acumulada ≤ `P`.
  * - "Fechada" e "vencida" usam sempre as **datas da fatura** (`invoiceDatesOf`), nunca as da
- *   parcela isolada (D25).
+ *   parcela isolada (D25). Precedência (D31): datas gravadas por fatura (`card_invoice_dates`) →
+ *   datas gravadas nas parcelas do mês (a maior) → dias atuais do cartão.
  */
 import { addMonths, invoiceDates } from '../common/invoice-dates';
 import { sumCents, toCents } from '../common/money';
@@ -50,11 +51,20 @@ export interface LedgerPaymentInput {
   paidOn: string | null;
 }
 
+/** Datas gravadas por fatura (D31, `card_invoice_dates`). */
+export interface LedgerRecordedDatesInput {
+  invoiceMonth: string;
+  closingDate: string;
+  dueDate: string;
+}
+
 export interface CardLedgerInput {
   card: LedgerCardInput;
   installments: readonly LedgerInstallmentInput[];
   charges: readonly LedgerChargeInput[];
   payments: readonly LedgerPaymentInput[];
+  /** D31: datas gravadas por fatura; omitido = nenhuma. */
+  recordedDates?: readonly LedgerRecordedDatesInput[];
   /** Data de calendário de hoje (`Clock.today()`), `YYYY-MM-DD`. */
   today: string;
 }
@@ -93,8 +103,13 @@ export interface CardLedger {
   /** Itens de dívida na ordem FIFO (D5), com a cobertura alocada. */
   items: readonly LedgerItem[];
   payments: readonly LedgerPaymentInput[];
-  /** Datas gravadas por mês de fatura com parcelas (maior em caso de divergência). */
+  /**
+   * Datas da fatura por mês com gravação (D25/D31): as gravadas por fatura (`recordedDates`) e,
+   * nos demais meses com parcelas, as gravadas nas parcelas (maior em caso de divergência).
+   */
   storedDates: ReadonlyMap<string, InvoiceDates>;
+  /** D31: só as datas gravadas por fatura (`card_invoice_dates`). */
+  recordedDates: ReadonlyMap<string, InvoiceDates>;
   /** `P`: Σ de todos os pagamentos. */
   paidCents: number;
   debtCents: number;
@@ -170,6 +185,11 @@ function validateInput(input: CardLedgerInput): void {
     assertMonth('payment.invoiceMonth', p.invoiceMonth);
     if (p.paidOn !== null) assertDate('payment.paidOn', p.paidOn);
   }
+  for (const r of input.recordedDates ?? []) {
+    assertMonth('recorded.invoiceMonth', r.invoiceMonth);
+    assertDate('recorded.closingDate', r.closingDate);
+    assertDate('recorded.dueDate', r.dueDate);
+  }
 }
 
 // ---------- razão ----------
@@ -236,6 +256,13 @@ export function buildCardLedger(input: CardLedgerInput): CardLedger {
       dueDate: prev && prev.dueDate > i.dueDate ? prev.dueDate : i.dueDate,
     });
   }
+  // D31: as gravadas por fatura têm precedência sobre as das parcelas
+  const recordedDates = new Map<string, InvoiceDates>();
+  for (const r of input.recordedDates ?? []) {
+    const dates = { closingDate: r.closingDate, dueDate: r.dueDate };
+    recordedDates.set(r.invoiceMonth, dates);
+    storedDates.set(r.invoiceMonth, dates);
+  }
 
   return {
     today,
@@ -247,6 +274,7 @@ export function buildCardLedger(input: CardLedgerInput): CardLedger {
     items,
     payments: input.payments,
     storedDates,
+    recordedDates,
     paidCents,
     debtCents,
     outstandingCents: Math.max(debtCents - paidCents, 0),
@@ -280,8 +308,8 @@ export function cardBalance(ledger: CardLedger): {
 }
 
 /**
- * Datas da fatura `month` (D25): as gravadas nas parcelas do mês (D14), a maior em caso de
- * divergência; sem parcelas, pelos dias atuais do cartão.
+ * Datas da fatura `month` (D25): 1º as gravadas por fatura (D31); senão as gravadas nas parcelas
+ * do mês (D14), a maior em caso de divergência; sem nenhuma, pelos dias atuais do cartão.
  */
 export function invoiceDatesOf(ledger: CardLedger, month: string): InvoiceDates {
   return ledger.storedDates.get(month) ?? invoiceDates(month, ledger.card);
@@ -318,6 +346,43 @@ export function currentOpenInvoiceMonth(ledger: CardLedger): string {
   let month = addMonths(ledger.today.slice(0, 7), -1);
   while (isClosed(ledger, month)) month = addMonths(month, 1);
   return month;
+}
+
+/**
+ * D31: datas a gravar antes de mudar os dias do cartão (o razão precisa ter sido carregado com os
+ * dias **atuais**, ainda não alterados; `newDays` são os dias que vão ser gravados): cada fatura
+ * **já fechada** (fechamento ≤ hoje, pelas datas vigentes — D25) com parcela, encargo ou
+ * pagamento, a fatura fechada mais recente mesmo vazia **e** todo mês fechado pelas datas
+ * vigentes que ficaria **aberto** pelos dias novos (`invoiceDates(M, newDays).closingDate` >
+ * hoje), mesmo vazio — senão ele "reabriria" (D9/D32). Meses já gravados ficam de fora (gravação
+ * nunca é sobrescrita). Ordem por mês.
+ */
+export function closedInvoiceDatesToRecord(
+  ledger: CardLedger,
+  newDays: { closingDay: number; dueDay: number },
+): (InvoiceDates & { month: string })[] {
+  const months = new Set<string>();
+  for (const i of ledger.items) months.add(i.invoiceMonth);
+  for (const p of ledger.payments) months.add(p.invoiceMonth);
+  const thisMonth = ledger.today.slice(0, 7);
+  // Fatura fechada mais recente: o fechamento de M cai em M ou M−1, então mês(hoje)+1 é o teto
+  let latest = addMonths(thisMonth, 1);
+  while (!isClosed(ledger, latest)) latest = addMonths(latest, -1);
+  months.add(latest);
+  // Meses que reabririam pelos dias novos. Janela finita: o fechamento da fatura M — pelas datas
+  // vigentes (gravadas ou dos dias) e pelos dias novos — cai sempre em M−1 ou M (é anterior ao
+  // vencimento, que é em M, e a regra do cartão o põe no mês do vencimento ou no anterior).
+  // "Fechada hoje" exige fechamento ≤ hoje ⇒ M ≤ mês(hoje)+1; "aberta pelos dias novos" exige
+  // fechamento > hoje ⇒ M ≥ mês(hoje). Logo só mês(hoje) e mês(hoje)+1 podem reabrir; a janela
+  // mês(hoje)−2 … mês(hoje)+2 cobre isso com folga.
+  for (let delta = -2; delta <= 2; delta++) {
+    const month = addMonths(thisMonth, delta);
+    if (invoiceDates(month, newDays).closingDate > ledger.today) months.add(month);
+  }
+  return [...months]
+    .sort()
+    .filter((month) => !ledger.recordedDates.has(month) && isClosed(ledger, month))
+    .map((month) => ({ month, ...invoiceDatesOf(ledger, month) }));
 }
 
 /** D9: pagamento/encargo só em fatura já fechada ou na fatura aberta atual. */

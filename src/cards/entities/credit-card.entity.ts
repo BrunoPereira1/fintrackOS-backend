@@ -7,6 +7,7 @@ import {
   Index,
   CreateDateColumn,
   UpdateDateColumn,
+  Unique,
 } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 
@@ -18,7 +19,13 @@ export enum CardBrand {
   HIPERCARD = 'hipercard',
 }
 
+/**
+ * `UQ_credit_cards_id_user` (redundante com a PK) só existe como alvo de FK composta: tabelas
+ * filhas referenciam `(id, user_id)` para o banco garantir que o cartão é do mesmo usuário
+ * (ex.: `card_invoice_dates`).
+ */
 @Entity('credit_cards')
+@Unique('UQ_credit_cards_id_user', ['id', 'userId'])
 export class CreditCard {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

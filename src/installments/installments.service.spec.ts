@@ -273,6 +273,10 @@ describe('InstallmentsService', () => {
       expect(selectSql).toMatch(/t\.card_id = \$1 AND t\.user_id = \$2/);
       // "Fechada" pela data da fatura (maior closing_date do mês, D25)
       expect(selectSql).toMatch(/HAVING max\(i\.closing_date\) > \$3::date/);
+      // D31: mês com datas gravadas por fatura (fechada) nunca é reagendado
+      expect(selectSql).toMatch(
+        /NOT EXISTS \(\s*SELECT 1 FROM card_invoice_dates d\s+WHERE d\.card_id = \$1 AND d\.user_id = \$2\s+AND d\.invoice_month = to_char\(i\.due_date, 'YYYY-MM'\)/,
+      );
       expect(selectParams).toEqual([CARD_ID, USER_ID, TODAY]);
       expect(query.mock.calls[1][1]).toEqual(['2026-03-25', '2026-04-05', ['i1', 'i2']]);
       expect(query.mock.calls[2][1]).toEqual(['2026-12-25', '2027-01-05', ['i3']]);

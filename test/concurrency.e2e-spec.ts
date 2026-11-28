@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import {
+  BadRequestException,
   ConflictException,
   HttpException,
   NotFoundException,
@@ -366,6 +367,68 @@ describe('Concorrência (e2e, banco real)', () => {
       expect(await installmentsOf(tx.id)).toEqual([['2026-04-05', '2026-04-12', 90]]);
     });
 
+    it('(c) mudar os dias × compra no fechamento gravado: a compra vê a data gravada (D31/D32)', async () => {
+      // Fecha 10/vence 17 → fecha 16/vence 20, hoje 15/03: a 2026-03 fechou em 10/03 e é gravada
+      // (pelos dias novos fecharia 16/03 — reabriria). Compra de 12/03: com a gravação vai para
+      // 2026-04 (16/04, 20/04); sem ela (findRecorded lido antes da trava, quando a mudança ainda
+      // não comitou) cairia na 2026-03 pelos dias novos (16/03, 20/03).
+      const card = await newCard();
+
+      const [edit, purchase] = await inOrder(
+        card.id,
+        () => cards.update(card.id, user.id, { closingDay: 16, dueDay: 20 }),
+        () => buy(card.id, 70, '2026-03-12'),
+      );
+
+      expect(edit.status).toBe('fulfilled');
+      expect(purchase.status).toBe('fulfilled');
+      const [recorded] = await db.query(
+        `SELECT to_char(closing_date, 'YYYY-MM-DD') AS c FROM card_invoice_dates
+         WHERE card_id = $1 AND invoice_month = '2026-03'`,
+        [card.id],
+      );
+      expect(recorded).toEqual({ c: '2026-03-10' });
+      const tx = (purchase as PromiseFulfilledResult<Transaction>).value;
+      expect(await installmentsOf(tx.id)).toEqual([['2026-04-16', '2026-04-20', 70]]);
+    });
+
+    it('D30: cardId alheio no body não trava a linha da vítima (responde 400 sem esperar)', async () => {
+      const victim = await db.getRepository(User).save({
+        firebaseUid: `e2e-${randomUUID()}`,
+        email: `e2e-${randomUUID()}@test.local`,
+        plan: Plan.PREMIUM,
+      });
+      try {
+        const victimCard = await db.getRepository(CreditCard).save({
+          name: 'Cartão da vítima',
+          brand: CardBrand.VISA,
+          closingDay: 10,
+          dueDay: 17,
+          creditLimit: 5000,
+          userId: victim.id,
+        });
+        const lock = await holdCardLock(victimCard.id);
+        try {
+          const attempt = buy(victimCard.id, 10, '2026-03-20');
+          attempt.catch(() => undefined);
+          const outcome = await Promise.race([
+            attempt.then(
+              () => 'fulfilled',
+              (err: unknown) => err,
+            ),
+            new Promise((r) => setTimeout(() => r('blocked'), 1500)),
+          ]);
+          // trava só por id: ficaria esperando a vítima soltar a linha (canal de tempo)
+          expect(outcome).toEqual(new BadRequestException(ErrorMessages.TRANSACTION_INVALID_CARD));
+          expect(await waitersOf(lock.pid)).toBe(0);
+        } finally {
+          await lock.release();
+        }
+      } finally {
+        await db.getRepository(User).delete(victim.id);
+      }
+    });
+
     it('(d) recálculos, remoções, splits e pagamentos simultâneos: sem deadlock nem 500', async () => {
       const outcomes: unknown[] = [];
       for (let round = 0; round < 8; round++) {
@@ -394,11 +457,14 @@ describe('Concorrência (e2e, banco real)', () => {
       expect(outcomes.map((r) => (r as Error).message)).not.toContain(
         ErrorMessages.CONCURRENT_UPDATE,
       );
-      // só erros de regra (404 de quem chegou depois da remoção; 409 de split pendente; 422)
+      // só erros de regra (404 de quem chegou depois da remoção — ou 400 genérico do split, cujo
+      // transactionId vem do body (D30); 409 de split pendente; 422)
       for (const reason of outcomes) {
         expect(reason).toBeInstanceOf(HttpException);
         expect(
           reason instanceof NotFoundException ||
+            (reason instanceof BadRequestException &&
+              reason.message === ErrorMessages.SPLIT_INVALID_TRANSACTION) ||
             reason instanceof UnprocessableEntityException ||
             (reason instanceof ConflictException &&
               reason.message === ErrorMessages.TRANSACTION_HAS_PENDING_SPLITS),

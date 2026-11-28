@@ -232,4 +232,158 @@ describe('InstallmentCalculatorService', () => {
       }
     });
   });
+
+  describe('D32: fatura da compra respeita as datas gravadas por fatura (D31)', () => {
+    // Cartão mudou de "fecha 25, vence 5" para "fecha 28, vence 10" com hoje = 27/11/2026;
+    // a fatura 2026-12 fechou em 25/11 e foi gravada.
+    const DEC = { closingDate: '2026-11-25', dueDate: '2026-12-05' };
+    const calc = (
+      purchaseDate: string,
+      recordedDates?: ReadonlyMap<string, { closingDate: string; dueDate: string }>,
+      n = 3,
+    ) =>
+      service
+        .calculate({
+          totalAmount: 300,
+          installmentsCount: n,
+          purchaseDate,
+          card: mockCard(28, 10),
+          recordedDates,
+        })
+        .map((i) => [i.closingDate, i.dueDate]);
+
+    it('compra no fechamento gravado ou depois → fatura seguinte; parcelas seguintes +1 mês', () => {
+      const recorded = new Map([['2026-12', DEC]]);
+      // pelos dias atuais, 27/11 cairia em 2026-12 (fecha 28/11)
+      expect(calc('2026-11-27', recorded)).toEqual([
+        [d(2026, 12, 28), d(2027, 1, 10)],
+        [d(2027, 1, 28), d(2027, 2, 10)],
+        [d(2027, 2, 28), d(2027, 3, 10)],
+      ]);
+      // fronteira: no próprio dia do fechamento gravado também avança
+      expect(calc('2026-11-25', recorded, 1)).toEqual([[d(2026, 12, 28), d(2027, 1, 10)]]);
+    });
+
+    it('compra antes do fechamento gravado → fica no mês gravado, com as datas gravadas', () => {
+      const recorded = new Map([['2026-12', DEC]]);
+      expect(calc('2026-11-24', recorded)).toEqual([
+        [d(2026, 11, 25), d(2026, 12, 5)],
+        [d(2026, 12, 28), d(2027, 1, 10)],
+        [d(2027, 1, 28), d(2027, 2, 10)],
+      ]);
+    });
+
+    it('avança enquanto o mês seguinte também estiver gravado e já fechado para a compra', () => {
+      const recorded = new Map([
+        ['2026-12', DEC],
+        ['2027-01', { closingDate: '2026-11-26', dueDate: '2027-01-02' }],
+        ['2027-03', { closingDate: '2027-02-20', dueDate: '2027-03-01' }],
+      ]);
+      // 27/11 ≥ 25/11 (2026-12) e ≥ 26/11 (2027-01) → 2027-02; a 3ª parcela cai no mês gravado
+      // 2027-03 e recebe as datas gravadas dele
+      expect(calc('2026-11-27', recorded)).toEqual([
+        [d(2027, 1, 28), d(2027, 2, 10)],
+        [d(2027, 2, 20), d(2027, 3, 1)],
+        [d(2027, 3, 28), d(2027, 4, 10)],
+      ]);
+    });
+
+    it('mês calculado sem gravação → dias atuais (gravação de outros meses não desloca)', () => {
+      const recorded = new Map([['2026-11', { closingDate: '2026-10-25', dueDate: '2026-11-05' }]]);
+      expect(calc('2026-11-27', recorded, 1)).toEqual([[d(2026, 11, 28), d(2026, 12, 10)]]);
+    });
+
+    it('sem mapa (ou mapa vazio) → comportamento anterior', () => {
+      const expected = [
+        [d(2026, 11, 28), d(2026, 12, 10)],
+        [d(2026, 12, 28), d(2027, 1, 10)],
+        [d(2027, 1, 28), d(2027, 2, 10)],
+      ];
+      expect(calc('2026-11-27')).toEqual(expected);
+      expect(calc('2026-11-27', new Map())).toEqual(expected);
+    });
+  });
+
+  describe('D32 regra geral: 1ª fatura (a partir do mês da compra) com fechamento efetivo > compra', () => {
+    type Recorded = ReadonlyMap<string, { closingDate: string; dueDate: string }>;
+    const datesOf = (
+      closingDay: number,
+      dueDay: number,
+      purchaseDate: string,
+      recordedDates?: Recorded,
+      n = 1,
+    ) =>
+      service
+        .calculate({
+          totalAmount: 300,
+          installmentsCount: n,
+          purchaseDate,
+          card: mockCard(closingDay, dueDay),
+          recordedDates,
+        })
+        .map((i) => [i.closingDate, i.dueDate]);
+
+    it('fecha 25 → 28: 2026-12 gravada (fechou 25/11); compra de 27/11 → 2027-01', () => {
+      const recorded = new Map([['2026-12', { closingDate: '2026-11-25', dueDate: '2026-12-05' }]]);
+      expect(datesOf(28, 10, '2026-11-27', recorded)).toEqual([[d(2026, 12, 28), d(2027, 1, 10)]]);
+    });
+
+    it('retroativa: dias novos "fecha 20, vence 5", 2026-12 gravada (fecha 25/11); compra de 22/11 → 2026-12 com as datas gravadas', () => {
+      const recorded = new Map([['2026-12', { closingDate: '2026-11-25', dueDate: '2026-12-05' }]]);
+      // pelos dias novos sozinhos, 22/11 (≥ dia 20) iria para 2027-01; o fechamento efetivo da
+      // 2026-12 (gravado, 25/11) é depois da compra → é a primeira fatura que a aceita
+      expect(datesOf(20, 5, '2026-11-22', recorded, 2)).toEqual([
+        [d(2026, 11, 25), d(2026, 12, 5)],
+        [d(2026, 12, 20), d(2027, 1, 5)],
+      ]);
+    });
+
+    it('colisão D33: "fecha 25/vence 5" → "fecha 27/vence 28", 2026-11 e 2026-12 gravadas; compra de 26/11 → 2027-01 (vence 28/01)', () => {
+      const recorded = new Map([
+        ['2026-11', { closingDate: '2026-10-25', dueDate: '2026-11-05' }],
+        ['2026-12', { closingDate: '2026-11-25', dueDate: '2026-12-05' }],
+      ]);
+      expect(datesOf(27, 28, '2026-11-26', recorded, 2)).toEqual([
+        [d(2027, 1, 27), d(2027, 1, 28)],
+        [d(2027, 2, 27), d(2027, 2, 28)],
+      ]);
+    });
+
+    it('virada de ano com meses gravados consecutivos (2026-12 e 2027-01), dias novos "fecha 20, vence 5"', () => {
+      const recorded = new Map([
+        ['2026-12', { closingDate: '2026-11-25', dueDate: '2026-12-05' }],
+        ['2027-01', { closingDate: '2026-12-25', dueDate: '2027-01-05' }],
+      ]);
+      // 22/12: 2026-12 fechou 25/11; 2027-01 (gravada) fecha 25/12 > 22/12 → 2027-01 com as
+      // datas gravadas; a 2ª e a 3ª parcelas pelos dias novos
+      expect(datesOf(20, 5, '2026-12-22', recorded, 3)).toEqual([
+        [d(2026, 12, 25), d(2027, 1, 5)],
+        [d(2027, 1, 20), d(2027, 2, 5)],
+        [d(2027, 2, 20), d(2027, 3, 5)],
+      ]);
+      // 26/12: as duas gravadas já fecharam → 2027-02 (fecha 20/01 pelos dias novos)
+      expect(datesOf(20, 5, '2026-12-26', recorded)).toEqual([[d(2027, 1, 20), d(2027, 2, 5)]]);
+      // no próprio dia do fechamento gravado (25/12) vai para a seguinte
+      expect(datesOf(20, 5, '2026-12-25', recorded)).toEqual([[d(2027, 1, 20), d(2027, 2, 5)]]);
+    });
+
+    it('sem mapa ou mapa vazio: idêntico ao comportamento sem gravação, para todos os dias', () => {
+      for (const [closing, due] of [
+        [25, 5],
+        [10, 17],
+        [15, 15],
+        [1, 28],
+        [28, 1],
+      ]) {
+        for (let day = 1; day <= 31; day++) {
+          const purchase = `2026-12-${String(day).padStart(2, '0')}`;
+          const plain = datesOf(closing, due, purchase, undefined, 2);
+          expect(datesOf(closing, due, purchase, new Map(), 2)).toEqual(plain);
+          // melhor dia de compra: antes do fechamento → fatura que fecha no mês; senão a seguinte
+          const closingMonth = day < closing ? 11 : 12; // 0-based: dez/2026 ou jan/2027
+          expect(plain[0][0]).toEqual(new Date(2026, closingMonth, closing));
+        }
+      }
+    });
+  });
 });

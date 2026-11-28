@@ -13,11 +13,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import {
+  ApiBadRequestResponse,
   ApiBearerAuth,
   ApiCreatedResponse,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiTags,
+  ApiUnprocessableEntityResponse,
 } from '@nestjs/swagger';
 import { AuthGuard } from '../auth/guards/auth.guard';
 import { TierGuard } from '../auth/guards/tier.guard';
@@ -41,6 +43,14 @@ export class TransactionsController {
 
   @Post()
   @ApiCreatedResponse({ type: TransactionResponseDto })
+  @ApiBadRequestResponse({
+    description:
+      'Dados inválidos, ou cartão inexistente ou de outro usuário (resposta genérica, D30)',
+  })
+  @ApiUnprocessableEntityResponse({
+    description:
+      'Regra violada: itens ≠ total, forma de pagamento incompatível, parcelas sem cartão, cartão arquivado ou total menor que o número de parcelas em centavos (D29)',
+  })
   create(@CurrentUser() user: User, @Body() dto: CreateTransactionDto) {
     return this.transactionsService.create(user.id, user.plan, dto);
   }
@@ -68,6 +78,10 @@ export class TransactionsController {
 
   @Patch(':id')
   @ApiOkResponse({ type: TransactionResponseDto })
+  @ApiUnprocessableEntityResponse({
+    description:
+      'Regra violada: itens/splits ≠ novo total, total menor que o número de parcelas em centavos (D29), parcela coberta ou nova data em fatura fechada, troca de forma de pagamento não permitida',
+  })
   update(
     @CurrentUser() user: User,
     @Param('id', ParseUUIDPipe) id: string,

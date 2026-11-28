@@ -12,6 +12,7 @@ import { mapTransactionConflict } from '../common/db-errors';
 import { InvoiceLedgerQuery } from '../invoices/invoice-ledger.query';
 import { buildCardLedger, cardBalance, CardLedger } from '../invoices/invoice-ledger.calculator';
 import { InstallmentsService } from '../installments/installments.service';
+import { CardInvoiceDatesService } from '../invoices/card-invoice-dates.service';
 
 @Injectable()
 export class CardsService {
@@ -22,6 +23,7 @@ export class CardsService {
     private readonly cardsRepo: Repository<CreditCard>,
     private readonly ledgers: InvoiceLedgerQuery,
     private readonly installmentsService: InstallmentsService,
+    private readonly invoiceDates: CardInvoiceDatesService,
     private readonly clock: Clock,
   ) {}
 
@@ -61,27 +63,53 @@ export class CardsService {
   /**
    * Trava a linha do cartão (`FOR UPDATE`) na transação de `em` e verifica a posse (404/403).
    * Ordem global de travas: **cartão → transação** (architecture.md).
+   *
+   * D30 — `onNotOwned` (ID veio do **body**): o `SELECT ... FOR UPDATE` filtra por `id` **e**
+   * `user_id`, então a linha de outro usuário nunca é travada (sem canal de tempo); nada
+   * encontrado (inexistente ou alheio) → lança `onNotOwned()`. Sem ele (rotas `:id`), trava por
+   * `id` e responde 404/403.
    */
-  async lockOwned(em: EntityManager, id: string, userId: string): Promise<CreditCard> {
-    const card = await em
-      .getRepository(CreditCard)
-      .findOne({ where: { id }, lock: { mode: 'pessimistic_write' } });
+  async lockOwned(
+    em: EntityManager,
+    id: string,
+    userId: string,
+    opts: { onNotOwned?: () => Error } = {},
+  ): Promise<CreditCard> {
+    const repo = em.getRepository(CreditCard);
+    const lock = { mode: 'pessimistic_write' } as const;
+    if (opts.onNotOwned) {
+      const owned = await repo.findOne({ where: { id, userId }, lock });
+      if (!owned) throw opts.onNotOwned();
+      return owned;
+    }
+    const card = await repo.findOne({ where: { id }, lock });
     if (!card) throw new NotFoundException(ErrorMessages.NOT_FOUND.CARD);
     if (card.userId !== userId) throw new ForbiddenException(ErrorMessages.ACCESS_DENIED);
     return card;
   }
 
   /**
-   * Edita o cartão sob a trava. D14: se `closingDay`/`dueDay` mudarem, as parcelas de faturas
-   * ainda não fechadas recebem as novas datas do mesmo mês de fatura (via `InstallmentsService`).
+   * Edita o cartão sob a trava. Se `closingDay`/`dueDay` mudarem: D31 — antes de tudo, grava as
+   * datas vigentes das faturas já fechadas (lidas com os dias antigos, ainda no banco); D14 — as
+   * parcelas de faturas ainda não fechadas recebem as novas datas do mesmo mês de fatura (via
+   * `InstallmentsService`). Tudo na mesma transação.
    */
   async update(id: string, userId: string, dto: UpdateCardDto): Promise<CardResponseDto> {
-    const today = this.clock.today(); // o mesmo "hoje" no reagendamento D14 e nos saldos
+    const today = this.clock.today(); // o mesmo "hoje" em D31, no reagendamento D14 e nos saldos
     const saved = await this.inTransaction(async (em) => {
       const card = await this.lockOwned(em, id, userId);
       const daysChanged =
         (dto.closingDay !== undefined && dto.closingDay !== card.closingDay) ||
         (dto.dueDay !== undefined && dto.dueDay !== card.dueDay);
+      // D31: antes de salvar os dias novos — o razão é lido do banco com os dias antigos; os
+      // dias novos (dto mesclado com os atuais) decidem quais meses fechados reabririam
+      if (daysChanged) {
+        const newDays = {
+          closingDay: dto.closingDay ?? card.closingDay,
+          dueDay: dto.dueDay ?? card.dueDay,
+        };
+        await this.invoiceDates.recordClosedInvoices(em, card.id, userId, newDays, today);
+      }
       Object.assign(card, dto);
       if (daysChanged) {
         await this.installmentsService.rescheduleOpenInvoices(

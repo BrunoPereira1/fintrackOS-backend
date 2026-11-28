@@ -1,6 +1,6 @@
 import { DataSource, EntityManager } from 'typeorm';
 import { Clock } from '../common/clock';
-import { cardBalance } from './invoice-ledger.calculator';
+import { cardBalance, invoiceDatesOf } from './invoice-ledger.calculator';
 import { InvoiceLedgerQuery } from './invoice-ledger.query';
 
 const USER_ID = 'user-uuid-1';
@@ -14,8 +14,10 @@ function fakeQuery(rows: {
   installments?: unknown[];
   charges?: unknown[];
   payments?: unknown[];
+  recorded?: unknown[];
 }) {
   return jest.fn((sql: string) => {
+    if (/FROM card_invoice_dates/.test(sql)) return Promise.resolve(rows.recorded ?? []);
     if (/FROM credit_cards/.test(sql)) return Promise.resolve(rows.cards ?? []);
     if (/FROM installments/.test(sql)) return Promise.resolve(rows.installments ?? []);
     if (/FROM invoice_charges/.test(sql)) return Promise.resolve(rows.charges ?? []);
@@ -77,7 +79,7 @@ describe('InvoiceLedgerQuery', () => {
 
     const ledgers = await new InvoiceLedgerQuery(ds, clock).loadLedgers(USER_ID);
 
-    expect(query).toHaveBeenCalledTimes(4);
+    expect(query).toHaveBeenCalledTimes(5);
     // Toda consulta filtra pelo usuário ($1) e recebe o filtro de cartões ($2, null = todos)
     for (const [sql, params] of query.mock.calls as unknown as [string, unknown[]][]) {
       expect(sql).toMatch(/user_id = \$1/);
@@ -92,6 +94,41 @@ describe('InvoiceLedgerQuery', () => {
       credit: 30,
       availableLimit: null,
     });
+  });
+
+  it('D31: carrega as datas gravadas por fatura, por cartão, com precedência sobre os dias', async () => {
+    const query = fakeQuery({
+      cards: [card(CARD_A), card(CARD_B)],
+      recorded: [
+        {
+          cardId: CARD_A,
+          invoiceMonth: '2026-02',
+          closingDate: '2026-01-25',
+          dueDate: '2026-02-05',
+        },
+        {
+          cardId: 'outro',
+          invoiceMonth: '2026-02',
+          closingDate: '2026-01-20',
+          dueDate: '2026-02-01',
+        },
+      ],
+    });
+    const ledgers = await new InvoiceLedgerQuery(
+      { query } as unknown as DataSource,
+      clock,
+    ).loadLedgers(USER_ID);
+
+    const recordedSql = (query.mock.calls as unknown as [string, unknown[]][]).find(([sql]) =>
+      /FROM card_invoice_dates/.test(sql),
+    );
+    expect(recordedSql?.[0]).toMatch(/user_id = \$1/);
+    expect(recordedSql?.[0]).toMatch(/to_char\(d\.closing_date, 'YYYY-MM-DD'\)/);
+    expect(invoiceDatesOf(ledgers.get(CARD_A)!, '2026-02')).toEqual({
+      closingDate: '2026-01-25',
+      dueDate: '2026-02-05',
+    });
+    expect(ledgers.get(CARD_B)!.recordedDates.size).toBe(0);
   });
 
   it('cartão sem lançamentos ganha razão vazio', async () => {
@@ -113,7 +150,7 @@ describe('InvoiceLedgerQuery', () => {
     });
 
     expect(dsQuery).not.toHaveBeenCalled();
-    expect(emQuery).toHaveBeenCalledTimes(4);
+    expect(emQuery).toHaveBeenCalledTimes(5);
     for (const [, params] of emQuery.mock.calls as unknown as [string, unknown[]][]) {
       expect(params).toEqual([USER_ID, [CARD_A]]);
     }

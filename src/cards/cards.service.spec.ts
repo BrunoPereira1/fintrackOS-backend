@@ -1,12 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { EntityManager, IsNull, QueryFailedError } from 'typeorm';
 import { CardsService } from './cards.service';
 import { CreditCard, CardBrand } from './entities/credit-card.entity';
 import { InvoiceLedgerQuery } from '../invoices/invoice-ledger.query';
 import { buildCardLedger } from '../invoices/invoice-ledger.calculator';
 import { InstallmentsService } from '../installments/installments.service';
+import { CardInvoiceDatesService } from '../invoices/card-invoice-dates.service';
 import { Clock } from '../common/clock';
 import { ErrorMessages } from '../common/constants/error-messages';
 
@@ -62,6 +68,7 @@ describe('CardsService', () => {
   let em: EntityManager;
   let ledgers: { loadLedgers: jest.Mock };
   let installments: { rescheduleOpenInvoices: jest.Mock };
+  let invoiceDates: { recordClosedInvoices: jest.Mock };
 
   let clock: { today: jest.Mock };
   beforeEach(async () => {
@@ -80,6 +87,7 @@ describe('CardsService', () => {
     };
     ledgers = { loadLedgers: jest.fn().mockResolvedValue(new Map()) };
     installments = { rescheduleOpenInvoices: jest.fn().mockResolvedValue(0) };
+    invoiceDates = { recordClosedInvoices: jest.fn().mockResolvedValue(0) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -87,6 +95,7 @@ describe('CardsService', () => {
         { provide: getRepositoryToken(CreditCard), useValue: repo },
         { provide: InvoiceLedgerQuery, useValue: ledgers },
         { provide: InstallmentsService, useValue: installments },
+        { provide: CardInvoiceDatesService, useValue: invoiceDates },
         { provide: Clock, useValue: clock },
       ],
     }).compile();
@@ -213,6 +222,31 @@ describe('CardsService', () => {
         new ForbiddenException(ErrorMessages.ACCESS_DENIED),
       );
     });
+
+    describe('D30: com onNotOwned (ID do body)', () => {
+      const onNotOwned = () => new BadRequestException(ErrorMessages.TRANSACTION_INVALID_CARD);
+
+      it('trava filtrando por id E user_id (linha alheia nunca é travada)', async () => {
+        emRepo.findOne.mockResolvedValue(mockCard());
+        const card = await service.lockOwned(em, 'card-uuid-1', USER_ID, { onNotOwned });
+        expect(card.id).toBe('card-uuid-1');
+        expect(emRepo.findOne).toHaveBeenCalledWith({
+          where: { id: 'card-uuid-1', userId: USER_ID },
+          lock: { mode: 'pessimistic_write' },
+        });
+      });
+
+      it('nada encontrado (inexistente ou alheio) → o erro de onNotOwned', async () => {
+        emRepo.findOne.mockResolvedValue(null);
+        await expect(
+          service.lockOwned(em, 'card-uuid-1', OTHER_USER_ID, { onNotOwned }),
+        ).rejects.toThrow(new BadRequestException(ErrorMessages.TRANSACTION_INVALID_CARD));
+        expect(emRepo.findOne).toHaveBeenCalledWith({
+          where: { id: 'card-uuid-1', userId: OTHER_USER_ID },
+          lock: { mode: 'pessimistic_write' },
+        });
+      });
+    });
   });
 
   describe('update', () => {
@@ -242,6 +276,54 @@ describe('CardsService', () => {
       expect(clock.today).toHaveBeenCalledTimes(1);
     });
 
+    it('D31: grava as datas das faturas fechadas antes do reagendamento e antes de salvar os dias', async () => {
+      const order: string[] = [];
+      invoiceDates.recordClosedInvoices.mockImplementation(() => {
+        order.push('record');
+        return Promise.resolve(1);
+      });
+      installments.rescheduleOpenInvoices.mockImplementation(() => {
+        order.push('reschedule');
+        return Promise.resolve(0);
+      });
+      emRepo.save.mockImplementation((c: CreditCard) => {
+        order.push('save');
+        return Promise.resolve(c);
+      });
+      emRepo.findOne.mockResolvedValue(mockCard());
+
+      await service.update('card-uuid-1', USER_ID, { closingDay: 28, dueDay: 10 });
+
+      // mesmo em (sob a trava do cartão) e o mesmo "hoje" do reagendamento
+      // D31: com os dias novos, para gravar também os meses que reabririam
+      expect(invoiceDates.recordClosedInvoices).toHaveBeenCalledWith(
+        em,
+        'card-uuid-1',
+        USER_ID,
+        { closingDay: 28, dueDay: 10 },
+        TODAY,
+      );
+      expect(order).toEqual(['record', 'reschedule', 'save']);
+    });
+
+    it('D31: dias novos = dto mesclado com os atuais (mudou só um dos dois)', async () => {
+      emRepo.findOne.mockResolvedValue(mockCard()); // fecha 10, vence 17
+      await service.update('card-uuid-1', USER_ID, { dueDay: 5 });
+      expect(invoiceDates.recordClosedInvoices).toHaveBeenCalledWith(
+        em,
+        'card-uuid-1',
+        USER_ID,
+        { closingDay: 10, dueDay: 5 },
+        TODAY,
+      );
+    });
+
+    it('D31: sem mudar dias (ou reenviando os mesmos) não grava datas', async () => {
+      emRepo.findOne.mockResolvedValue(mockCard());
+      await service.update('card-uuid-1', USER_ID, { closingDay: 10, dueDay: 17, name: 'X' });
+      expect(invoiceDates.recordClosedInvoices).not.toHaveBeenCalled();
+    });
+
     it('403 para cartão de outro usuário, sem gravar', async () => {
       emRepo.findOne.mockResolvedValue(mockCard());
       await expect(service.update('card-uuid-1', OTHER_USER_ID, { closingDay: 1 })).rejects.toThrow(
@@ -249,6 +331,7 @@ describe('CardsService', () => {
       );
       expect(emRepo.save).not.toHaveBeenCalled();
       expect(installments.rescheduleOpenInvoices).not.toHaveBeenCalled();
+      expect(invoiceDates.recordClosedInvoices).not.toHaveBeenCalled();
     });
 
     it('deadlock na transação → 409', async () => {

@@ -35,9 +35,18 @@ export class InvoiceCharge {
   @Column({ name: 'card_id', type: 'uuid' })
   cardId!: string;
 
-  // CASCADE só dispara na exclusão do usuário: cartão é arquivado, nunca apagado (D12)
+  // FK composta (card_id, user_id) → credit_cards(id, user_id): o banco garante que o cartão é do
+  // mesmo usuário do encargo. CASCADE só dispara na exclusão do usuário: cartão é arquivado,
+  // nunca apagado (D12). O TypeORM lê o nome da FK composta da 1ª coluna.
   @ManyToOne(() => CreditCard, { onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'card_id', foreignKeyConstraintName: 'FK_invoice_charges_card' })
+  @JoinColumn([
+    {
+      name: 'card_id',
+      referencedColumnName: 'id',
+      foreignKeyConstraintName: 'FK_invoice_charges_card',
+    },
+    { name: 'user_id', referencedColumnName: 'userId' },
+  ])
   card!: CreditCard;
 
   /** Fatura (mês do vencimento) em que o encargo foi lançado, `YYYY-MM`. */

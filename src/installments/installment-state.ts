@@ -79,8 +79,8 @@ export interface CoverageThreshold {
  * parcelas no service: por cartão, as parcelas **totalmente cobertas** formam um prefixo da
  * ordem FIFO (§2), então basta o limiar = chave `(mês, transação, número)` da última delas
  * (a ordem completa usa também `transactions.created_at`, lido no SQL). `pastDue` = meses de
- * fatura com vencimento (datas da fatura, D25) antes de hoje — parcela não coberta neles é
- * `overdue`.
+ * fatura com vencimento (datas da fatura, D25 — inclusive as gravadas por fatura, D31) antes de
+ * hoje — parcela não coberta neles é `overdue`.
  */
 export function listingCoverage(ledgers: ReadonlyMap<string, CardLedger>): {
   covered: CoverageThreshold[];
